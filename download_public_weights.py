@@ -147,8 +147,8 @@ def public_weight_specs(project_root: Path, torch_cache_root: Path, hf_endpoint:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Download public pretrained weights for MoT H200 training.')
-    parser.add_argument('--project-root', type=Path, default=Path('/home/heyefei/lichenge'), help='Root containing 1d-tokenizer and LlamaGen.')
-    parser.add_argument('--torch-cache-root', type=Path, default=Path('/home/heyefei/.cache/torch'), help='Torch cache root containing hub/checkpoints.')
+    parser.add_argument('--project-root', type=Path, default=Path(".."), help='Root containing 1d-tokenizer and LlamaGen.')
+    parser.add_argument('--torch-cache-root', type=Path, default=Path("../.cache/torch"), help='Torch cache root containing hub/checkpoints.')
     parser.add_argument('--test', action='store_true', help='Download into a temp dir, validate, then delete it.')
     parser.add_argument('--test-dir', type=Path, default=None, help='Optional temp dir for --test.')
     parser.add_argument('--only', nargs='*', default=None, help='Subset to download: titok_l32 llamagen_vq_ds16_c2i dinov2_vits14 lpips_vgg')

@@ -1,0 +1,7 @@
+.cache/
+results/
+__pycache__/
+models/__pycache__/
+weights/*.pt
+weights/*.pth
+weights/*.ckpt

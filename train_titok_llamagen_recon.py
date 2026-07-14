@@ -250,7 +250,7 @@ class PatchAndDINOFeatureDiscriminator(nn.Module):
         num_stages=3,
         patch_loss_weight=1.0,
         dino_loss_weight=0.25,
-        dino_repo="/home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main",
+        dino_repo="../.cache/torch/hub/facebookresearch_dinov2_main",
         dino_model="dinov2_vits14",
         dino_input_size=224,
         dino_head_hidden=256,
@@ -309,7 +309,7 @@ def build_discriminator(args, device):
             num_stages=args.disc_num_stages,
             patch_loss_weight=1.0,
             dino_loss_weight=getattr(args, "dino_loss_weight", 0.25),
-            dino_repo=getattr(args, "dino_repo", "/home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main"),
+            dino_repo=getattr(args, "dino_repo", "../.cache/torch/hub/facebookresearch_dinov2_main"),
             dino_model=getattr(args, "dino_model", "dinov2_vits14"),
             dino_input_size=getattr(args, "dino_input_size", 224),
             dino_head_hidden=getattr(args, "dino_head_hidden", 256),
@@ -1124,7 +1124,7 @@ def main(args):
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--data-path", type=str, default="/var/tmp/heyefei_ImageNet/train")
+    parser.add_argument("--data-path", type=str, default="../ImageNet/train")
     parser.add_argument("--output-dir", type=str, default="results/titok_llamagen_recon_stage_a")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--reset-optimizer", action="store_true", default=False)
@@ -1168,7 +1168,7 @@ def build_parser():
     parser.add_argument("--disc-loss-weights", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-hidden-channels", type=int, default=128)
     parser.add_argument("--disc-num-stages", type=int, default=3)
-    parser.add_argument("--dino-repo", type=str, default="/home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main")
+    parser.add_argument("--dino-repo", type=str, default="../.cache/torch/hub/facebookresearch_dinov2_main")
     parser.add_argument("--dino-model", type=str, default="dinov2_vits14")
     parser.add_argument("--dino-input-size", type=int, default=224)
     parser.add_argument("--dino-loss-weight", type=float, default=0.25)
@@ -1191,11 +1191,11 @@ def build_parser():
     parser.add_argument("--codebook-entropy-target", type=float, default=0.0)
     parser.add_argument("--lambda-codebook-ce", type=float, default=0.0)
     parser.add_argument("--codebook-ce-label-smoothing", type=float, default=0.0)
-    parser.add_argument("--titok-root", type=str, default="/home/heyefei/lichenge/1d-tokenizer")
-    parser.add_argument("--titok-config", type=str, default="/home/heyefei/lichenge/1d-tokenizer/configs/infer/TiTok/titok_l32.yaml")
-    parser.add_argument("--titok-ckpt", type=str, default="/home/heyefei/lichenge/1d-tokenizer/tokenizer_titok_l32.bin")
-    parser.add_argument("--llamagen-root", type=str, default="/home/heyefei/lichenge/LlamaGen")
-    parser.add_argument("--llamagen-ckpt", type=str, default="/home/heyefei/lichenge/LlamaGen/pretrained_models/vq_ds16_c2i.pt")
+    parser.add_argument("--titok-root", type=str, default="../1d-tokenizer")
+    parser.add_argument("--titok-config", type=str, default="../1d-tokenizer/configs/infer/TiTok/titok_l32.yaml")
+    parser.add_argument("--titok-ckpt", type=str, default="../1d-tokenizer/tokenizer_titok_l32.bin")
+    parser.add_argument("--llamagen-root", type=str, default="../LlamaGen")
+    parser.add_argument("--llamagen-ckpt", type=str, default="../LlamaGen/pretrained_models/vq_ds16_c2i.pt")
     parser.add_argument("--codebook-size", type=int, default=16384)
     parser.add_argument("--codebook-embed-dim", type=int, default=8)
     return parser

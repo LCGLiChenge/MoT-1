@@ -1,6 +1,6 @@
 # H200 migration notes
 
-Current package source: `/home/heyefei/lichenge/Mixture-of-Tokenizer/version4`
+Current package source: `../Mixture-of-Tokenizer/version4`
 
 Main training config:
 
@@ -11,7 +11,7 @@ configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze
 Launch command for 8 H200 GPUs:
 
 ```bash
-cd /home/heyefei/lichenge/MoT
+cd MoT
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
   --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch.yaml
@@ -31,8 +31,8 @@ External dependencies and weights must also exist on the H200 machine, or the pa
 Public pretrained weights download:
 
 ```bash
-cd /home/heyefei/lichenge/MoT
-python download_public_weights.py --project-root /home/heyefei/lichenge --torch-cache-root /home/heyefei/.cache/torch --hf-endpoint https://hf-mirror.com
+cd MoT
+python download_public_weights.py --project-root .. --torch-cache-root ../.cache/torch --hf-endpoint https://hf-mirror.com
 ```
 
 This downloads only public pretrained dependencies:

@@ -11,7 +11,7 @@ adapter_init: results/titok_llamagen_mix_ae_unfreeze_encoder_gan_from_latest_4gp
 adapter_init_ema: true
 require_latent_decoder: false
 
-data_path: /home/heyefei/ImageNet/validation
+data_path: ../ImageNet/validation
 num_images: 50000
 batch_size: 8
 num_workers: 4
@@ -51,10 +51,10 @@ eval_paths: [mix]
 
 lg_latent_channels: 256
 lg_head_channels: 256
-titok_root: /home/heyefei/lichenge/1d-tokenizer
-titok_config: /home/heyefei/lichenge/1d-tokenizer/configs/infer/TiTok/titok_l32.yaml
-titok_ckpt: /home/heyefei/lichenge/1d-tokenizer/tokenizer_titok_l32.bin
-llamagen_root: /home/heyefei/lichenge/LlamaGen
-llamagen_ckpt: /home/heyefei/lichenge/LlamaGen/pretrained_models/vq_ds16_c2i.pt
+titok_root: ../1d-tokenizer
+titok_config: ../1d-tokenizer/configs/infer/TiTok/titok_l32.yaml
+titok_ckpt: ../1d-tokenizer/tokenizer_titok_l32.bin
+llamagen_root: ../LlamaGen
+llamagen_ckpt: ../LlamaGen/pretrained_models/vq_ds16_c2i.pt
 codebook_size: 16384
 codebook_embed_dim: 8

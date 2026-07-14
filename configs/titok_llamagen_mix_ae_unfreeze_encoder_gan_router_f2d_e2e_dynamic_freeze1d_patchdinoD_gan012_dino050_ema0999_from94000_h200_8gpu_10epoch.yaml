@@ -6,7 +6,7 @@
 #   torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
 #     --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch.yaml
 
-data_path: /var/tmp/heyefei_ImageNet/train
+data_path: ../ImageNet/train
 output_dir: results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch
 
 adapter_init: weights/step_00066000.pt
@@ -107,7 +107,7 @@ disc_scales: [1.0]
 disc_loss_weights: [1.0]
 disc_hidden_channels: 128
 disc_num_stages: 3
-dino_repo: /home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main
+dino_repo: ../.cache/torch/hub/facebookresearch_dinov2_main
 dino_model: dinov2_vits14
 dino_input_size: 224
 dino_loss_weight: 0.50
@@ -126,11 +126,11 @@ lg_head_channels: 256
 latent_head_mode: feature
 codebook_temperature: 1.0
 
-titok_root: /home/heyefei/lichenge/1d-tokenizer
-titok_config: /home/heyefei/lichenge/1d-tokenizer/configs/infer/TiTok/titok_l32.yaml
-titok_ckpt: /home/heyefei/lichenge/1d-tokenizer/tokenizer_titok_l32.bin
+titok_root: ../1d-tokenizer
+titok_config: ../1d-tokenizer/configs/infer/TiTok/titok_l32.yaml
+titok_ckpt: ../1d-tokenizer/tokenizer_titok_l32.bin
 
-llamagen_root: /home/heyefei/lichenge/LlamaGen
-llamagen_ckpt: /home/heyefei/lichenge/LlamaGen/pretrained_models/vq_ds16_c2i.pt
+llamagen_root: ../LlamaGen
+llamagen_ckpt: ../LlamaGen/pretrained_models/vq_ds16_c2i.pt
 codebook_size: 16384
 codebook_embed_dim: 8
