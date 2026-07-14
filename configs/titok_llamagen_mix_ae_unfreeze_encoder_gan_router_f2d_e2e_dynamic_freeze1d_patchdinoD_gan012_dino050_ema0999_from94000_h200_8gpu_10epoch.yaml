@@ -1,0 +1,136 @@
+# H200 8-GPU EMA continuation from step 94000 for about 10 epochs.
+# Keeps the frozen 1D adapter and Router fixed, resumes EMA step94000 checkpoint,
+# and continues decoder-only patch+DINO-D training with EMA enabled.
+# Launch with 8 H200 GPUs:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+#   torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
+#     --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch.yaml
+
+data_path: /var/tmp/heyefei_ImageNet/train
+output_dir: results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch
+
+adapter_init: weights/step_00066000.pt
+adapter_init_ema: true
+resume: weights/step_00094000.pt
+resume_non_strict: true
+reset_optimizer: false
+reset_discriminator: false
+reset_selector_state: false
+
+image_size: 256
+titok_input_range: zero_1
+llamagen_input_range: minus1_1
+random_crop: false
+random_flip: false
+batch_size: 32
+accum_steps: 1
+max_steps: 144050
+num_workers: 12
+limit_samples: 0
+
+train_adapter: false
+train_llamagen_encoder: true
+train_llamagen_quant_conv: true
+train_llamagen_quantizer: false
+train_post_quant_conv: true
+train_llamagen_decoder: true
+train_router: true
+lr: 5.0e-6
+lr_llamagen_encoder: 2.0e-7
+lr_llamagen: 8.0e-7
+lr_router: 0.0
+lr_scheduler: constant
+warmup_steps: 0
+min_lr: 0.0
+weight_decay: 0.01
+weight_decay_llamagen: 0.0
+weight_decay_router: 0.0
+max_grad_norm: 1.0
+mixed_precision: bf16
+use_ema: true
+ema_decay: 0.999
+
+image_loss: l1
+perceptual_loss: lpips
+lambda_perceptual: 0.3
+lambda_lpips: 0.3
+lambda_base: 0.0
+lambda_mix: 2.0
+lambda_native: 0.0
+lambda_feat: 0.0
+lambda_feat_moment: 0.0
+lambda_router_budget: 2.0
+lambda_router_binary: 0.01
+
+mask_ratio_min: 0.1
+mask_ratio_max: 0.9
+mask_selection: router_e2e_dynamic
+mask_ratio: 0.5
+mask_error_weight: 0.6
+mask_gradient_weight: 0.3
+mask_variance_weight: 0.1
+selector_threshold: 0.3
+target_mask_ratio: 0.5
+use_threshold_ema_controller: false
+selector_threshold_lr: 0.0
+selector_ratio_ema_decay: 0.95
+selector_threshold_min: 0.0
+selector_threshold_max: 1.0
+score_normalize_scope: per_image
+
+router_hidden_dim: 128
+router_depth: 3
+router_min_ratio: 0.05
+router_max_ratio: 0.90
+router_target_mean_ratio: 0.50
+router_min_tokens: -1
+router_max_tokens: -1
+router_tau: 0.7
+router_detach_inputs: true
+router_gain_aux_weight: 1.0
+router_gain_aux_decay_steps: 0
+router_gain_aux_target_ratio: 0.5
+router_only_steps: 0
+router_only_disable_gan: true
+
+lambda_gan: 0.12
+gan_start_step: 72000
+gan_ramp_steps: 0
+discriminator_factor: 1.0
+lr_d: 2.0e-5
+d_every: 1
+d_warmup_steps: 0
+lecam_regularization_weight: 0.001
+lecam_ema_decay: 0.999
+discriminator_type: patch_dino
+disc_scales: [1.0]
+disc_loss_weights: [1.0]
+disc_hidden_channels: 128
+disc_num_stages: 3
+dino_repo: /home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main
+dino_model: dinov2_vits14
+dino_input_size: 224
+dino_loss_weight: 0.50
+dino_head_hidden: 256
+dino_use_patch_tokens: true
+
+log_every: 50
+sample_every: 500
+save_every: 1000
+save_step_checkpoints: true
+save_steps: []
+sample_images: 8
+
+lg_latent_channels: 256
+lg_head_channels: 256
+latent_head_mode: feature
+codebook_temperature: 1.0
+
+titok_root: /home/heyefei/lichenge/1d-tokenizer
+titok_config: /home/heyefei/lichenge/1d-tokenizer/configs/infer/TiTok/titok_l32.yaml
+titok_ckpt: /home/heyefei/lichenge/1d-tokenizer/tokenizer_titok_l32.bin
+
+llamagen_root: /home/heyefei/lichenge/LlamaGen
+llamagen_ckpt: /home/heyefei/lichenge/LlamaGen/pretrained_models/vq_ds16_c2i.pt
+codebook_size: 16384
+codebook_embed_dim: 8

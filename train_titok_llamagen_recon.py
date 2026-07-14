@@ -1,0 +1,1228 @@
+import argparse
+import math
+import os
+import sys
+import time
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+from omegaconf import OmegaConf
+from PIL import Image, ImageDraw
+from safetensors.torch import load_file as load_safetensors_file
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
+from torchvision import models, transforms
+from torchvision.datasets import ImageFolder
+
+from models import TiTokLlamaGenStage2
+
+
+def add_path(path):
+    path = str(path)
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+
+def load_titok(titok_root, config_path, ckpt_path, device):
+    add_path(titok_root)
+    from modeling.titok import TiTok
+
+    config = OmegaConf.load(config_path)
+    tokenizer = TiTok(config)
+    if str(ckpt_path).endswith(".safetensors"):
+        state = load_safetensors_file(str(ckpt_path), device="cpu")
+    else:
+        state = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(state, dict) and "model" in state:
+            state = state["model"]
+    tokenizer.load_state_dict(state, strict=True)
+    tokenizer.to(device)
+    tokenizer.eval()
+    return tokenizer
+
+
+def load_llamagen_vq(llamagen_root, ckpt_path, device, codebook_size=16384, codebook_embed_dim=8):
+    add_path(llamagen_root)
+    from tokenizer.tokenizer_image.vq_model import VQ_models
+
+    vq = VQ_models["VQ-16"](codebook_size=codebook_size, codebook_embed_dim=codebook_embed_dim)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(ckpt, dict) and "ema" in ckpt:
+        state = ckpt["ema"]
+    elif isinstance(ckpt, dict) and "model" in ckpt:
+        state = ckpt["model"]
+    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+        state = ckpt["state_dict"]
+    else:
+        state = ckpt
+    vq.load_state_dict(state, strict=True)
+    vq.to(device)
+    vq.eval().requires_grad_(False)
+    return vq
+
+
+class ConvNeXtPerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = models.convnext_small(weights=models.ConvNeXt_Small_Weights.IMAGENET1K_V1).eval()
+        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None])
+        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None])
+        self.requires_grad_(False)
+
+    def forward(self, input_01, target_01):
+        input_01 = F.interpolate(input_01, size=224, mode="bilinear", align_corners=False, antialias=True)
+        target_01 = F.interpolate(target_01, size=224, mode="bilinear", align_corners=False, antialias=True)
+        pred = self.model((input_01 - self.imagenet_mean) / self.imagenet_std)
+        target = self.model((target_01 - self.imagenet_mean) / self.imagenet_std)
+        return F.mse_loss(pred, target, reduction="mean")
+
+
+def build_perceptual_loss(args, device):
+    if args.perceptual_loss == "none" or get_perceptual_weight(args) <= 0.0:
+        return None
+    if args.perceptual_loss == "lpips":
+        add_path(args.llamagen_root)
+        from tokenizer.tokenizer_image.lpips import LPIPS
+
+        loss = LPIPS().to(device)
+    elif args.perceptual_loss == "convnext_s":
+        loss = ConvNeXtPerceptualLoss().to(device)
+    else:
+        raise ValueError(f"unsupported perceptual_loss {args.perceptual_loss}")
+    loss.eval().requires_grad_(False)
+    return loss
+
+
+def get_perceptual_weight(args):
+    return args.lambda_lpips if args.lambda_perceptual is None else args.lambda_perceptual
+
+
+def compute_image_loss(pred, target, loss_type):
+    if loss_type == "l1":
+        return F.l1_loss(pred.float(), target.float())
+    if loss_type == "l2":
+        return F.mse_loss(pred.float(), target.float())
+    raise ValueError(f"unsupported image_loss {loss_type}")
+
+
+def compute_perceptual_loss(perceptual, perceptual_name, pred, target):
+    if perceptual is None:
+        return pred.new_zeros(())
+    if perceptual_name == "lpips":
+        return perceptual(pred.float(), target.float()).mean()
+    if perceptual_name == "convnext_s":
+        pred_01 = image_to_zero_one(pred, "minus1_1")
+        target_01 = image_to_zero_one(target, "minus1_1")
+        return perceptual(pred_01, target_01)
+    raise ValueError(f"unsupported perceptual_loss {perceptual_name}")
+
+
+def freeze_module(module):
+    module.eval()
+    for param in module.parameters():
+        param.requires_grad_(False)
+
+
+def set_requires_grad(module, requires_grad):
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad_(requires_grad)
+
+
+class MultiScalePatchDiscriminator(nn.Module):
+    def __init__(self, discriminator_cls, scales, loss_weights, hidden_channels=128, num_stages=3):
+        super().__init__()
+        if len(scales) != len(loss_weights):
+            raise ValueError(f"disc_scales and disc_loss_weights length mismatch: {scales} vs {loss_weights}")
+        if not scales:
+            raise ValueError("disc_scales must not be empty")
+        self.scales = tuple(float(scale) for scale in scales)
+        self.loss_weights = tuple(float(weight) for weight in loss_weights)
+        if any(scale <= 0.0 for scale in self.scales):
+            raise ValueError(f"disc_scales must be positive, got {self.scales}")
+        if any(weight <= 0.0 for weight in self.loss_weights):
+            raise ValueError(f"disc_loss_weights must be positive, got {self.loss_weights}")
+        self.discriminators = nn.ModuleList(
+            discriminator_cls(hidden_channels=hidden_channels, num_stages=num_stages) for _ in self.scales
+        )
+
+    def forward(self, x):
+        outputs = []
+        for disc, scale, weight in zip(self.discriminators, self.scales, self.loss_weights):
+            if abs(scale - 1.0) < 1e-8:
+                x_scale = x
+            else:
+                size = (max(1, int(round(x.shape[-2] * scale))), max(1, int(round(x.shape[-1] * scale))))
+                x_scale = F.interpolate(x, size=size, mode="bilinear", align_corners=False, antialias=True)
+            outputs.append((disc(x_scale), weight))
+        return outputs
+
+    def load_primary_state_dict(self, state_dict, strict=True):
+        return self.discriminators[0].load_state_dict(state_dict, strict=strict)
+
+
+def parse_float_sequence(value, default):
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        return [float(part.strip()) for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        return [float(part) for part in value]
+    return [float(value)]
+
+
+def spectral_linear(in_features, out_features):
+    return nn.utils.spectral_norm(nn.Linear(in_features, out_features))
+
+
+class DINOFeatureDiscriminator(nn.Module):
+    def __init__(
+        self,
+        dino_repo,
+        dino_model="dinov2_vits14",
+        input_size=224,
+        hidden_dim=256,
+        use_patch_tokens=True,
+    ):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.use_patch_tokens = bool(use_patch_tokens)
+        if not dino_repo:
+            raise ValueError("dino_repo must point to a local torch hub DINOv2 repo")
+        backbone = torch.hub.load(str(dino_repo), str(dino_model), source="local", pretrained=True)
+        backbone.eval().requires_grad_(False)
+        self.dino_proxy = (backbone,)
+        embed_dim = int(getattr(backbone, "embed_dim", 384))
+        self.cls_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            spectral_linear(embed_dim, hidden_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            spectral_linear(hidden_dim, 1),
+        )
+        self.patch_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            spectral_linear(embed_dim, hidden_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            spectral_linear(hidden_dim, 1),
+        )
+        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None])
+        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None])
+
+    def _apply(self, fn, *args, **kwargs):
+        super()._apply(fn, *args, **kwargs)
+        self.dino_proxy[0]._apply(fn, *args, **kwargs)
+        return self
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.dino_proxy[0].eval()
+        return self
+
+    def forward(self, x_01):
+        x = x_01.float()
+        if x.shape[-2:] != (self.input_size, self.input_size):
+            x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
+        x = (x - self.imagenet_mean) / self.imagenet_std
+        features = self.dino_proxy[0].forward_features(x)
+        if not isinstance(features, dict) or "x_norm_clstoken" not in features:
+            raise RuntimeError("DINO backbone must return forward_features with x_norm_clstoken")
+        cls_token = features["x_norm_clstoken"]
+        logits = [self.cls_head(cls_token)]
+        patch_tokens = features.get("x_norm_patchtokens")
+        if self.use_patch_tokens and patch_tokens is not None:
+            patch_logits = self.patch_head(patch_tokens).squeeze(-1)
+            logits.append(patch_logits)
+        return torch.cat(logits, dim=1)
+
+
+class PatchAndDINOFeatureDiscriminator(nn.Module):
+    primary_load_name = "primary_patch"
+
+    def __init__(
+        self,
+        discriminator_cls,
+        hidden_channels=128,
+        num_stages=3,
+        patch_loss_weight=1.0,
+        dino_loss_weight=0.25,
+        dino_repo="/home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main",
+        dino_model="dinov2_vits14",
+        dino_input_size=224,
+        dino_head_hidden=256,
+        dino_use_patch_tokens=True,
+    ):
+        super().__init__()
+        if patch_loss_weight <= 0.0 or dino_loss_weight <= 0.0:
+            raise ValueError("patch_loss_weight and dino_loss_weight must be positive")
+        self.patch_loss_weight = float(patch_loss_weight)
+        self.dino_loss_weight = float(dino_loss_weight)
+        self.patch_discriminator = discriminator_cls(hidden_channels=hidden_channels, num_stages=num_stages)
+        self.dino_discriminator = DINOFeatureDiscriminator(
+            dino_repo=dino_repo,
+            dino_model=dino_model,
+            input_size=dino_input_size,
+            hidden_dim=dino_head_hidden,
+            use_patch_tokens=dino_use_patch_tokens,
+        )
+
+    def forward(self, x):
+        return [
+            (self.patch_discriminator(x), self.patch_loss_weight),
+            (self.dino_discriminator(x), self.dino_loss_weight),
+        ]
+
+    def load_primary_state_dict(self, state_dict, strict=True):
+        return self.patch_discriminator.load_state_dict(state_dict, strict=strict)
+
+
+def build_discriminator(args, device):
+    if args.lambda_gan <= 0.0:
+        return None
+    add_path(args.titok_root)
+    from modeling.modules.discriminator import NLayerDiscriminator
+
+    discriminator_type = getattr(args, "discriminator_type", "patch")
+    if discriminator_type == "patch":
+        discriminator = NLayerDiscriminator(
+            hidden_channels=args.disc_hidden_channels,
+            num_stages=args.disc_num_stages,
+        ).to(device)
+    elif discriminator_type == "multiscale_patch":
+        scales = parse_float_sequence(getattr(args, "disc_scales", [1.0, 0.5, 0.25]), [1.0, 0.5, 0.25])
+        weights = parse_float_sequence(getattr(args, "disc_loss_weights", [1.0, 0.5, 0.25]), [1.0, 0.5, 0.25])
+        discriminator = MultiScalePatchDiscriminator(
+            NLayerDiscriminator,
+            scales=scales,
+            loss_weights=weights,
+            hidden_channels=args.disc_hidden_channels,
+            num_stages=args.disc_num_stages,
+        ).to(device)
+    elif discriminator_type == "patch_dino":
+        discriminator = PatchAndDINOFeatureDiscriminator(
+            NLayerDiscriminator,
+            hidden_channels=args.disc_hidden_channels,
+            num_stages=args.disc_num_stages,
+            patch_loss_weight=1.0,
+            dino_loss_weight=getattr(args, "dino_loss_weight", 0.25),
+            dino_repo=getattr(args, "dino_repo", "/home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main"),
+            dino_model=getattr(args, "dino_model", "dinov2_vits14"),
+            dino_input_size=getattr(args, "dino_input_size", 224),
+            dino_head_hidden=getattr(args, "dino_head_hidden", 256),
+            dino_use_patch_tokens=getattr(args, "dino_use_patch_tokens", True),
+        ).to(device)
+    else:
+        raise ValueError(f"unsupported discriminator_type {discriminator_type}")
+    return discriminator
+
+
+def iter_weighted_logits(logits):
+    if isinstance(logits, (list, tuple)):
+        if len(logits) == 0:
+            raise ValueError("empty discriminator logits")
+        for item in logits:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                yield item[0], float(item[1])
+            else:
+                yield item, 1.0
+    else:
+        yield logits, 1.0
+
+
+def split_discriminator_logits(logits, chunks=2, dim=0):
+    if isinstance(logits, (list, tuple)):
+        split_parts = [[] for _ in range(chunks)]
+        for logit, weight in iter_weighted_logits(logits):
+            pieces = logit.chunk(chunks, dim=dim)
+            for index, piece in enumerate(pieces):
+                split_parts[index].append((piece, weight))
+        return tuple(split_parts)
+    return logits.chunk(chunks, dim=dim)
+
+
+def weighted_logits_mean(logits):
+    total = None
+    denom = 0.0
+    for logit, weight in iter_weighted_logits(logits):
+        value = torch.mean(logit) * weight
+        total = value if total is None else total + value
+        denom += weight
+    if total is None or denom <= 0.0:
+        raise ValueError("empty discriminator logits")
+    return total / denom
+
+
+def gan_g_loss_from_logits(logits_fake):
+    total = None
+    denom = 0.0
+    for logit, weight in iter_weighted_logits(logits_fake):
+        value = -torch.mean(logit) * weight
+        total = value if total is None else total + value
+        denom += weight
+    if total is None or denom <= 0.0:
+        raise ValueError("empty discriminator logits")
+    return total / denom
+
+
+def hinge_d_loss(logits_real, logits_fake):
+    total = None
+    denom = 0.0
+    for (real, weight_real), (fake, weight_fake) in zip(iter_weighted_logits(logits_real), iter_weighted_logits(logits_fake)):
+        if abs(weight_real - weight_fake) > 1e-8:
+            raise ValueError(f"real/fake discriminator weights mismatch: {weight_real} vs {weight_fake}")
+        loss_real = torch.mean(F.relu(1.0 - real))
+        loss_fake = torch.mean(F.relu(1.0 + fake))
+        value = 0.5 * (loss_real + loss_fake) * weight_real
+        total = value if total is None else total + value
+        denom += weight_real
+    if total is None or denom <= 0.0:
+        raise ValueError("empty discriminator logits")
+    return total / denom
+
+
+def compute_lecam_loss(logits_real_mean, logits_fake_mean, ema_real_logits_mean, ema_fake_logits_mean):
+    loss = torch.mean(torch.pow(F.relu(logits_real_mean - ema_fake_logits_mean), 2))
+    loss = loss + torch.mean(torch.pow(F.relu(ema_real_logits_mean - logits_fake_mean), 2))
+    return loss
+
+
+def gan_factor_for_step(args, step):
+    if args.lambda_gan <= 0.0 or step < args.gan_start_step:
+        return 0.0
+    if args.gan_ramp_steps <= 0:
+        return args.discriminator_factor
+    ramp = min(1.0, max(0.0, float(step - args.gan_start_step) / float(args.gan_ramp_steps)))
+    return args.discriminator_factor * ramp
+
+
+def image_to_zero_one(x, image_range):
+    if image_range == "minus1_1":
+        return (x.float() + 1.0) * 0.5
+    if image_range == "zero_1":
+        return x.float()
+    raise ValueError(f"unsupported image range {image_range}")
+
+
+def discriminator_input(x, image_range):
+    return image_to_zero_one(x, image_range)
+
+
+def llamagen_decoder_feature_from_quant(vq_model, quant, codebook_embed_dim=8):
+    if quant.ndim != 4 or quant.shape[-2:] != (16, 16):
+        raise ValueError(f"unexpected LlamaGen encode output shape: {tuple(quant.shape)}")
+    if quant.shape[1] == codebook_embed_dim:
+        return vq_model.post_quant_conv(quant)
+    if quant.shape[1] == 256:
+        return quant
+    raise ValueError(
+        f"cannot infer LlamaGen feature space from encode output {tuple(quant.shape)}; "
+        f"expected channels {codebook_embed_dim} or 256"
+    )
+
+
+def target_llamagen_decoder_feature_and_codes(vq_model, x, codebook_embed_dim=8):
+    quant, _, info = vq_model.encode(x)
+    feature = llamagen_decoder_feature_from_quant(vq_model, quant, codebook_embed_dim)
+    code_indices = None
+    if info is not None and len(info) >= 3 and info[2] is not None:
+        code_indices = info[2].view(x.shape[0], quant.shape[-2], quant.shape[-1]).long()
+    return feature, code_indices
+
+
+def target_llamagen_decoder_feature(vq_model, x, codebook_embed_dim=8):
+    feature, _ = target_llamagen_decoder_feature_and_codes(vq_model, x, codebook_embed_dim)
+    return feature
+
+
+def make_transform(image_size, random_crop=False, random_flip=False):
+    crop = transforms.RandomCrop(image_size) if random_crop else transforms.CenterCrop(image_size)
+    ops = [
+        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        crop,
+    ]
+    if random_flip:
+        ops.append(transforms.RandomHorizontalFlip())
+    ops.append(transforms.ToTensor())
+    return transforms.Compose(ops)
+
+
+def convert_image_range(x_01, image_range):
+    if image_range == "zero_1":
+        return x_01
+    if image_range == "minus1_1":
+        return x_01 * 2.0 - 1.0
+    raise ValueError(f"unsupported image range {image_range}")
+
+
+def denorm_to_uint8(x, image_range="minus1_1"):
+    x = x.detach().float().cpu()
+    if image_range == "minus1_1":
+        x = (x.clamp(-1.0, 1.0) + 1.0) * 0.5
+    elif image_range == "zero_1":
+        x = x.clamp(0.0, 1.0)
+    else:
+        raise ValueError(f"unsupported image range {image_range}")
+    x = (x.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+    return x
+
+
+def chw_to_pil(x):
+    return Image.fromarray(x.permute(1, 2, 0).numpy())
+
+
+def save_recon_grid(path, x, x_rec, x_mix=None, max_images=8, image_range="minus1_1"):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    originals = denorm_to_uint8(x[:max_images], image_range)
+    recs = denorm_to_uint8(x_rec[:max_images], image_range)
+    tensors = [originals, recs]
+    headers = ["target", "1d"]
+    if x_mix is not None:
+        tensors.append(denorm_to_uint8(x_mix[:max_images], image_range))
+        headers.append("mix")
+
+    n = originals.shape[0]
+    cell = originals.shape[-1]
+    label_h = 18
+    canvas = Image.new("RGB", (len(tensors) * cell, n * (cell + label_h)), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    for i in range(n):
+        for j, batch in enumerate(tensors):
+            x0 = j * cell
+            y0 = i * (cell + label_h)
+            draw.text((x0 + 4, y0 + 2), headers[j], fill=(0, 0, 0))
+            canvas.paste(chw_to_pil(batch[i]), (x0, y0 + label_h))
+    canvas.save(path)
+
+
+
+def exclude_from_weight_decay(name, param):
+    return (
+        param.ndim < 2
+        or "ln" in name
+        or "bias" in name
+        or "latent_tokens" in name
+        or "mask_token" in name
+        or "embedding" in name
+        or "norm" in name
+        or "gamma" in name
+        or "embed" in name
+    )
+
+
+def adamw_param_groups(module, weight_decay):
+    no_decay = []
+    decay = []
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if exclude_from_weight_decay(name, param):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    groups = []
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    if decay:
+        groups.append({"params": decay, "weight_decay": weight_decay})
+    return groups
+
+
+class TrainableEMA:
+    def __init__(self, module, decay=0.999):
+        self.decay = decay
+        self.shadow = {
+            name: param.detach().clone()
+            for name, param in module.named_parameters()
+            if param.requires_grad
+        }
+
+    @torch.no_grad()
+    def update(self, module):
+        for name, param in module.named_parameters():
+            if name not in self.shadow:
+                continue
+            self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+
+    def state_dict(self):
+        return {name: value.detach().cpu().clone() for name, value in self.shadow.items()}
+
+    def load_state_dict(self, state_dict, device=None):
+        for name, value in state_dict.items():
+            tensor = value.detach().clone()
+            if device is not None:
+                tensor = tensor.to(device)
+            self.shadow[name] = tensor
+
+
+def random_spatial_mask(batch_size, ratio_min, ratio_max, device):
+    ratios = torch.empty(batch_size, device=device).uniform_(ratio_min, ratio_max)
+    noise = torch.rand(batch_size, 1, 16, 16, device=device)
+    masks = []
+    for i, ratio in enumerate(ratios):
+        k = int(round(float(ratio) * 256))
+        flat = torch.zeros(256, device=device, dtype=noise.dtype)
+        if k > 0:
+            topk = torch.topk(noise[i, 0].flatten(), k).indices
+            flat[topk] = 1.0
+        masks.append(flat.reshape(1, 16, 16))
+    return torch.stack(masks, dim=0)
+
+
+def cycle(loader, sampler=None):
+    epoch = 0
+    while True:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        for batch in loader:
+            yield batch
+        epoch += 1
+
+
+def compute_lr(args, step, base_lr=None, start_step=0, max_steps=None):
+    base_lr = args.lr if base_lr is None else base_lr
+    max_steps = args.max_steps if max_steps is None else max_steps
+    rel_step = max(step - start_step, 0)
+    total_steps = max(max_steps - start_step, 1)
+    if args.lr_scheduler == "constant":
+        return base_lr
+    if args.lr_scheduler != "cosine":
+        raise ValueError(f"unsupported lr_scheduler {args.lr_scheduler}")
+    if args.warmup_steps > 0 and rel_step < args.warmup_steps:
+        return base_lr * rel_step / args.warmup_steps
+    denom = max(total_steps - args.warmup_steps, 1)
+    progress = min(max((rel_step - args.warmup_steps) / denom, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return args.min_lr + (base_lr - args.min_lr) * cosine
+
+
+def set_optimizer_lr(optimizer, lr):
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+@torch.no_grad()
+def codebook_usage_stats(code_probs):
+    if code_probs is None:
+        return ""
+    probs = code_probs.detach().float()
+    codebook_size = probs.shape[1]
+    max_prob = probs.amax(dim=1).mean().item()
+    probs_for_log = probs.clamp_min(1e-12)
+    entropy = -(probs_for_log * probs_for_log.log()).sum(dim=1).mean().item()
+    entropy = entropy / math.log(codebook_size)
+    top1 = probs.argmax(dim=1)
+    unique_denom = min(codebook_size, top1.numel())
+    top1_use = top1.unique().numel() / max(unique_denom, 1)
+    return f" code_ent {entropy:.4f} code_maxp {max_prob:.4f} code_top1_use {top1_use:.4f}"
+
+
+def compute_codebook_entropy_loss(code_probs, entropy_target):
+    if code_probs is None or entropy_target <= 0.0:
+        return None
+    probs = code_probs.float().clamp_min(1e-12)
+    entropy = -(probs * probs.log()).sum(dim=1).mean() / math.log(probs.shape[1])
+    return F.relu(entropy_target - entropy).square()
+
+
+def compute_feature_moment_loss(pred, target):
+    pred = pred.float()
+    target = target.float()
+    pred_mean = pred.mean(dim=(2, 3))
+    target_mean = target.mean(dim=(2, 3))
+    pred_std = pred.var(dim=(2, 3), unbiased=False).clamp_min(1e-12).sqrt()
+    target_std = target.var(dim=(2, 3), unbiased=False).clamp_min(1e-12).sqrt()
+    return F.l1_loss(pred_mean, target_mean) + F.l1_loss(pred_std, target_std)
+
+
+def compute_codebook_ce_loss(code_logits, code_targets, label_smoothing=0.0):
+    if code_logits is None or code_targets is None:
+        return None
+    if code_logits.ndim != 4 or code_targets.ndim != 3:
+        raise ValueError(f"bad code CE shapes logits={tuple(code_logits.shape)} targets={tuple(code_targets.shape)}")
+    if code_logits.shape[0] != code_targets.shape[0] or code_logits.shape[-2:] != code_targets.shape[-2:]:
+        raise ValueError(f"code CE shape mismatch logits={tuple(code_logits.shape)} targets={tuple(code_targets.shape)}")
+    return F.cross_entropy(code_logits.float(), code_targets.long(), label_smoothing=label_smoothing)
+
+
+@torch.no_grad()
+def compute_codebook_accuracy(code_logits, code_targets):
+    if code_logits is None or code_targets is None:
+        return code_logits.new_zeros(()) if code_logits is not None else torch.zeros(())
+    pred = code_logits.detach().argmax(dim=1)
+    return (pred == code_targets).float().mean()
+
+
+def compute_codebook_temperature(args, step):
+    final_temperature = args.codebook_temperature_final
+    if final_temperature is None or args.codebook_temperature_warmup_steps <= 0:
+        return args.codebook_temperature
+    progress = min(max(step / args.codebook_temperature_warmup_steps, 0.0), 1.0)
+    return args.codebook_temperature + (final_temperature - args.codebook_temperature) * progress
+
+
+def set_codebook_temperature(model, temperature):
+    core = model.module if isinstance(model, DDP) else model
+    core.latent_decoder.codebook_temperature = temperature
+
+
+def autocast_dtype(mixed_precision):
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    if mixed_precision == "fp16":
+        return torch.float16
+    if mixed_precision == "none":
+        return torch.float32
+    raise ValueError(f"unsupported mixed_precision {mixed_precision}")
+
+
+def distributed_setup():
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        rank = 0
+        world_size = 1
+        local_rank = 0
+    return distributed, rank, world_size, local_rank, device
+
+
+def main(args):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for training")
+    distributed, rank, world_size, local_rank, device = distributed_setup()
+    is_main = rank == 0
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    dataset = ImageFolder(args.data_path, transform=make_transform(args.image_size, args.random_crop, args.random_flip))
+    if args.limit_samples > 0:
+        dataset = Subset(dataset, list(range(min(args.limit_samples, len(dataset)))))
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if distributed else None
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    data_iter = cycle(loader, sampler)
+
+    titok = load_titok(args.titok_root, args.titok_config, args.titok_ckpt, device)
+    vq_model = load_llamagen_vq(args.llamagen_root, args.llamagen_ckpt, device, args.codebook_size, args.codebook_embed_dim)
+    perceptual = build_perceptual_loss(args, device)
+
+    model = TiTokLlamaGenStage2(
+        titok,
+        vq_model,
+        lg_latent_channels=args.lg_latent_channels,
+        head_channels=args.lg_head_channels,
+        head_mode=args.latent_head_mode,
+        codebook_size=args.codebook_size,
+        codebook_temperature=args.codebook_temperature,
+    ).to(device)
+
+    params = [p for p in model.latent_decoder.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        adamw_param_groups(model.latent_decoder, args.weight_decay),
+        lr=args.lr,
+        betas=(0.9, 0.999),
+    )
+    ema = TrainableEMA(model.latent_decoder, decay=args.ema_decay) if args.use_ema else None
+    discriminator = build_discriminator(args, device)
+    disc_params = [p for p in discriminator.parameters() if p.requires_grad] if discriminator is not None else []
+    optimizer_d = (
+        torch.optim.AdamW(
+            adamw_param_groups(discriminator, args.weight_decay),
+            lr=args.lr_d,
+            betas=(0.9, 0.999),
+        )
+        if discriminator is not None
+        else None
+    )
+    lecam_ema_real = torch.zeros((), device=device)
+    lecam_ema_fake = torch.zeros((), device=device)
+
+    start_step = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location="cpu")
+        state = ckpt.get("model", ckpt)
+        if isinstance(state, dict) and any(key.startswith("latent_decoder.") for key in state):
+            state = {key[len("latent_decoder."):]: value for key, value in state.items() if key.startswith("latent_decoder.")}
+        model.load_trainable_state_dict(state, strict=True)
+        if discriminator is not None and isinstance(ckpt, dict) and "discriminator" in ckpt:
+            discriminator.load_state_dict(ckpt["discriminator"], strict=True)
+        start_step = int(ckpt.get("step", 0)) if isinstance(ckpt, dict) else 0
+        if isinstance(ckpt, dict) and "optimizer" in ckpt and not args.reset_optimizer:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if optimizer_d is not None and isinstance(ckpt, dict) and "optimizer_d" in ckpt and not args.reset_optimizer:
+            optimizer_d.load_state_dict(ckpt["optimizer_d"])
+        if isinstance(ckpt, dict):
+            lecam_ema_real = ckpt.get("lecam_ema_real", lecam_ema_real.detach().cpu()).to(device)
+            lecam_ema_fake = ckpt.get("lecam_ema_fake", lecam_ema_fake.detach().cpu()).to(device)
+            if ema is not None and "model_ema" in ckpt:
+                ema.load_state_dict(ckpt["model_ema"], device=device)
+        if is_main:
+            print(f"resumed trainable decoder from {args.resume} at step {start_step}", flush=True)
+
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        if discriminator is not None:
+            discriminator = DDP(
+                discriminator,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+            )
+
+    out_dir = Path(args.output_dir)
+    if is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        dist.barrier()
+    log_path = out_dir / "log.txt"
+
+    if is_main:
+        core = model.module if distributed else model
+        trainable_params = sum(p.numel() for p in core.latent_decoder.parameters() if p.requires_grad)
+        effective_batch = args.batch_size * world_size * args.accum_steps
+        msg = (
+            f"dataset={len(dataset)} world_size={world_size} batch_size_per_gpu={args.batch_size} "
+            f"accum_steps={args.accum_steps} global_batch={effective_batch} trainable_params={trainable_params} "
+            f"loss_weights=image({args.image_loss}):{args.lambda_l1},perceptual({args.perceptual_loss}):{get_perceptual_weight(args)},"
+            f"feat:{args.lambda_feat},feat_moment:{args.lambda_feat_moment},mix:{args.lambda_mix},"
+            f"gan:{args.lambda_gan}@{args.gan_start_step}+ramp{args.gan_ramp_steps},"
+            f"code_ent:{args.lambda_codebook_entropy}@{args.codebook_entropy_target},"
+            f"code_ce:{args.lambda_codebook_ce},smooth:{args.codebook_ce_label_smoothing} "
+            f"ranges=titok:{args.titok_input_range},llamagen:{args.llamagen_input_range} "
+            f"head_mode:{args.latent_head_mode},codebook_temp:{args.codebook_temperature}->{args.codebook_temperature_final}"
+            f"/{args.codebook_temperature_warmup_steps} "
+            f"augment=random_crop:{args.random_crop},random_flip:{args.random_flip} lr_scheduler={args.lr_scheduler} "
+            f"lr:{args.lr},min_lr:{args.min_lr},warmup:{args.warmup_steps},lr_d:{args.lr_d} "
+            f"ema:{args.use_ema}@{args.ema_decay}"
+        )
+        print(msg, flush=True)
+        log_path.write_text(msg + "\n")
+
+    running = {
+        "loss": 0.0, "recon": 0.0, "mse01": 0.0, "lpips": 0.0, "feat": 0.0, "feat_moment": 0.0, "mix": 0.0,
+        "code_ent_loss": 0.0, "code_ce": 0.0, "code_acc": 0.0,
+        "gan_g": 0.0, "d_loss": 0.0, "lecam": 0.0,
+        "logits_real": 0.0, "logits_fake": 0.0, "grad": 0.0,
+    }
+    count = 0
+    start_time = time.time()
+    model.train()
+    for step in range(start_step + 1, args.max_steps + 1):
+        current_lr = compute_lr(args, step)
+        current_lr_d = compute_lr(args, step, base_lr=args.lr_d, start_step=args.gan_start_step)
+        current_codebook_temperature = compute_codebook_temperature(args, step)
+        set_codebook_temperature(model, current_codebook_temperature)
+        set_optimizer_lr(optimizer, current_lr)
+        if optimizer_d is not None:
+            set_optimizer_lr(optimizer_d, current_lr_d)
+        gan_factor = gan_factor_for_step(args, step)
+        train_discriminator = discriminator is not None and gan_factor > 0.0 and step % args.d_every == 0
+        core_for_frozen = model.module if distributed else model
+
+        optimizer.zero_grad(set_to_none=True)
+        if optimizer_d is not None:
+            optimizer_d.zero_grad(set_to_none=True)
+
+        last_x_lg = None
+        last_x_rec = None
+        last_x_mix_rec = None
+        last_f_1d_lg = None
+        last_f_2d_lg = None
+        last_code_probs = None
+        log_due = is_main and (step == 1 or step % args.log_every == 0)
+        metric_sums = {
+            "loss": 0.0, "recon": 0.0, "mse01": 0.0, "lpips": 0.0, "feat": 0.0, "feat_moment": 0.0, "mix": 0.0,
+            "code_ent_loss": 0.0, "code_ce": 0.0, "code_acc": 0.0,
+            "gan_g": 0.0, "d_loss": 0.0, "lecam": 0.0,
+            "logits_real": 0.0, "logits_fake": 0.0,
+        }
+
+        for _micro_step in range(args.accum_steps):
+            x_01, _ = next(data_iter)
+            x_01 = x_01.to(device, non_blocking=True)
+            x_titok = convert_image_range(x_01, args.titok_input_range)
+            x_lg = convert_image_range(x_01, args.llamagen_input_range)
+
+            with torch.no_grad():
+                f_2d_lg, code_targets = target_llamagen_decoder_feature_and_codes(
+                    core_for_frozen.llamagen_vq, x_lg, args.codebook_embed_dim
+                )
+
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype(args.mixed_precision), enabled=args.mixed_precision != "none"):
+                x_rec, extra = model(x_titok)
+                f_1d_lg = extra["f_1d_lg"]
+                code_probs = extra.get("code_probs")
+                code_logits = extra.get("code_logits")
+                if log_due:
+                    last_code_probs = code_probs
+                if f_1d_lg.shape[1:] != (args.lg_latent_channels, 16, 16):
+                    raise ValueError(f"bad f_1d_lg shape {tuple(f_1d_lg.shape)}")
+                if f_2d_lg.shape[1:] != (args.lg_latent_channels, 16, 16):
+                    raise ValueError(f"bad f_2d_lg shape {tuple(f_2d_lg.shape)}")
+                if x_rec.shape != x_lg.shape:
+                    raise ValueError(f"bad x_rec shape {tuple(x_rec.shape)} expected {tuple(x_lg.shape)}")
+
+                x_rec_01 = image_to_zero_one(x_rec, args.llamagen_input_range)
+                x_lg_01 = image_to_zero_one(x_lg, args.llamagen_input_range)
+                recon_loss = compute_image_loss(x_rec, x_lg, args.image_loss)
+                mse01_metric = F.mse_loss(x_rec_01.float(), x_lg_01.float())
+                lpips_loss = compute_perceptual_loss(perceptual, args.perceptual_loss, x_rec, x_lg)
+                feat_loss = F.l1_loss(f_1d_lg.float(), f_2d_lg.float())
+                feat_moment_loss = compute_feature_moment_loss(f_1d_lg, f_2d_lg)
+                codebook_entropy_loss = compute_codebook_entropy_loss(code_probs, args.codebook_entropy_target)
+                if codebook_entropy_loss is None:
+                    codebook_entropy_loss = x_rec.new_zeros(())
+                codebook_ce_loss = compute_codebook_ce_loss(
+                    code_logits, code_targets, args.codebook_ce_label_smoothing
+                )
+                if codebook_ce_loss is None:
+                    codebook_ce_loss = x_rec.new_zeros(())
+                codebook_acc = compute_codebook_accuracy(code_logits, code_targets).to(device=x_rec.device, dtype=x_rec.dtype)
+
+                mix_loss = x_rec.new_zeros(())
+                x_mix_rec = None
+                if args.lambda_mix > 0.0:
+                    mask = random_spatial_mask(x_lg.shape[0], args.mask_ratio_min, args.mask_ratio_max, x_lg.device).to(f_1d_lg.dtype)
+                    f_mix = (1.0 - mask) * f_1d_lg + mask * f_2d_lg
+                    x_mix_rec = core_for_frozen.llamagen_vq.decoder(f_mix)
+                    mix_loss = compute_image_loss(x_mix_rec, x_lg, args.image_loss)
+
+                gan_g_loss = x_rec.new_zeros(())
+                if discriminator is not None and gan_factor > 0.0:
+                    set_requires_grad(discriminator, False)
+                    logits_fake_for_g = discriminator(discriminator_input(x_rec, args.llamagen_input_range))
+                    gan_g_loss = gan_g_loss_from_logits(logits_fake_for_g)
+
+                loss = (
+                    args.lambda_l1 * recon_loss
+                    + get_perceptual_weight(args) * lpips_loss
+                    + args.lambda_feat * feat_loss
+                    + args.lambda_feat_moment * feat_moment_loss
+                    + args.lambda_mix * mix_loss
+                    + args.lambda_codebook_entropy * codebook_entropy_loss
+                    + args.lambda_codebook_ce * codebook_ce_loss
+                    + args.lambda_gan * gan_factor * gan_g_loss
+                )
+
+            (loss / args.accum_steps).backward()
+
+            d_loss = x_rec.new_zeros(())
+            lecam_loss = x_rec.new_zeros(())
+            logits_real_mean = x_rec.new_zeros(())
+            logits_fake_mean = x_rec.new_zeros(())
+            if train_discriminator:
+                set_requires_grad(discriminator, True)
+                real_for_d = discriminator_input(x_lg, args.llamagen_input_range).detach()
+                fake_for_d = discriminator_input(x_rec.detach(), args.llamagen_input_range)
+                logits_both = discriminator(torch.cat([real_for_d, fake_for_d], dim=0))
+                logits_real, logits_fake = split_discriminator_logits(logits_both, chunks=2, dim=0)
+                logits_real_mean = weighted_logits_mean(logits_real)
+                logits_fake_mean = weighted_logits_mean(logits_fake)
+                d_loss = gan_factor * hinge_d_loss(logits_real, logits_fake)
+                if args.lecam_regularization_weight > 0.0:
+                    lecam_loss = compute_lecam_loss(
+                        logits_real_mean,
+                        logits_fake_mean,
+                        lecam_ema_real,
+                        lecam_ema_fake,
+                    ) * args.lecam_regularization_weight
+                    d_loss = d_loss + lecam_loss
+                    lecam_ema_real = lecam_ema_real * args.lecam_ema_decay + logits_real_mean.detach() * (1.0 - args.lecam_ema_decay)
+                    lecam_ema_fake = lecam_ema_fake * args.lecam_ema_decay + logits_fake_mean.detach() * (1.0 - args.lecam_ema_decay)
+                (d_loss / args.accum_steps).backward()
+
+            metric_sums["loss"] += loss.detach().float().item()
+            metric_sums["recon"] += recon_loss.detach().float().item()
+            metric_sums["mse01"] += mse01_metric.detach().float().item()
+            metric_sums["lpips"] += lpips_loss.detach().float().item()
+            metric_sums["feat"] += feat_loss.detach().float().item()
+            metric_sums["feat_moment"] += feat_moment_loss.detach().float().item()
+            metric_sums["mix"] += mix_loss.detach().float().item()
+            metric_sums["code_ent_loss"] += codebook_entropy_loss.detach().float().item()
+            metric_sums["code_ce"] += codebook_ce_loss.detach().float().item()
+            metric_sums["code_acc"] += codebook_acc.detach().float().item()
+            metric_sums["gan_g"] += (args.lambda_gan * gan_factor * gan_g_loss).detach().float().item()
+            metric_sums["d_loss"] += d_loss.detach().float().item()
+            metric_sums["lecam"] += lecam_loss.detach().float().item()
+            metric_sums["logits_real"] += logits_real_mean.detach().float().item()
+            metric_sums["logits_fake"] += logits_fake_mean.detach().float().item()
+
+            last_x_lg = x_lg
+            last_x_rec = x_rec
+            last_x_mix_rec = x_mix_rec
+            last_f_1d_lg = f_1d_lg
+            last_f_2d_lg = f_2d_lg
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
+        optimizer.step()
+        if ema is not None:
+            ema.update(model.module.latent_decoder if distributed else model.latent_decoder)
+        if train_discriminator:
+            torch.nn.utils.clip_grad_norm_(disc_params, args.max_grad_norm)
+            optimizer_d.step()
+
+        vals = torch.tensor(
+            [
+                metric_sums["loss"] / args.accum_steps,
+                metric_sums["recon"] / args.accum_steps,
+                metric_sums["mse01"] / args.accum_steps,
+                metric_sums["lpips"] / args.accum_steps,
+                metric_sums["feat"] / args.accum_steps,
+                metric_sums["feat_moment"] / args.accum_steps,
+                metric_sums["mix"] / args.accum_steps,
+                metric_sums["code_ent_loss"] / args.accum_steps,
+                metric_sums["code_ce"] / args.accum_steps,
+                metric_sums["code_acc"] / args.accum_steps,
+                metric_sums["gan_g"] / args.accum_steps,
+                metric_sums["d_loss"] / args.accum_steps,
+                metric_sums["lecam"] / args.accum_steps,
+                metric_sums["logits_real"] / args.accum_steps,
+                metric_sums["logits_fake"] / args.accum_steps,
+                grad_norm.detach().float().item(),
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        if distributed:
+            dist.all_reduce(vals, op=dist.ReduceOp.AVG)
+        running["loss"] += vals[0].item()
+        running["recon"] += vals[1].item()
+        running["mse01"] += vals[2].item()
+        running["lpips"] += vals[3].item()
+        running["feat"] += vals[4].item()
+        running["feat_moment"] += vals[5].item()
+        running["mix"] += vals[6].item()
+        running["code_ent_loss"] += vals[7].item()
+        running["code_ce"] += vals[8].item()
+        running["code_acc"] += vals[9].item()
+        running["gan_g"] += vals[10].item()
+        running["d_loss"] += vals[11].item()
+        running["lecam"] += vals[12].item()
+        running["logits_real"] += vals[13].item()
+        running["logits_fake"] += vals[14].item()
+        running["grad"] += vals[15].item()
+        count += 1
+
+        x_lg = last_x_lg
+        x_rec = last_x_rec
+        x_mix_rec = last_x_mix_rec
+        f_1d_lg = last_f_1d_lg
+        f_2d_lg = last_f_2d_lg
+
+        if is_main and (step == 1 or step % args.log_every == 0):
+            denom = max(count, 1)
+            sec = (time.time() - start_time) / denom
+            with torch.no_grad():
+                stats = (
+                    f"f1d mean/std {f_1d_lg.float().mean().item():.4f}/{f_1d_lg.float().std().item():.4f} "
+                    f"f2d mean/std {f_2d_lg.float().mean().item():.4f}/{f_2d_lg.float().std().item():.4f} "
+                    f"xrec mean/std {x_rec.float().mean().item():.4f}/{x_rec.float().std().item():.4f}"
+                )
+                stats += codebook_usage_stats(last_code_probs)
+            mse01 = running["mse01"] / denom
+            psnr01 = -10.0 * math.log10(max(mse01, 1e-12))
+            msg = (
+                f"Step {step:08d} | loss {running['loss']/denom:.5f} | recon {running['recon']/denom:.5f} | "
+                f"mse01 {mse01:.5f} | psnr01 {psnr01:.2f} | "
+                f"lpips {running['lpips']/denom:.5f} | feat {running['feat']/denom:.5f} | "
+                f"feat_moment {running['feat_moment']/denom:.5f} | mix {running['mix']/denom:.5f} | code_ent_loss {running['code_ent_loss']/denom:.5f} | "
+                f"code_ce {running['code_ce']/denom:.5f} | code_acc {running['code_acc']/denom:.4f} | "
+                f"gan_g {running['gan_g']/denom:.5f} | d {running['d_loss']/denom:.5f} | "
+                f"lecam {running['lecam']/denom:.5f} | "
+                f"d_real {running['logits_real']/denom:.4f} | d_fake {running['logits_fake']/denom:.4f} | "
+                f"grad {running['grad']/denom:.4f} | lr {current_lr:.6g} | lr_d {current_lr_d:.6g} | "
+                f"cb_temp {current_codebook_temperature:.4f} | {sec:.3f}s/step | {stats}"
+            )
+            print(msg, flush=True)
+            with log_path.open("a") as f:
+                f.write(msg + "\n")
+            running = {
+                "loss": 0.0, "recon": 0.0, "mse01": 0.0, "lpips": 0.0, "feat": 0.0, "feat_moment": 0.0, "mix": 0.0,
+                "code_ent_loss": 0.0, "code_ce": 0.0, "code_acc": 0.0,
+                "gan_g": 0.0, "d_loss": 0.0, "lecam": 0.0,
+                "logits_real": 0.0, "logits_fake": 0.0, "grad": 0.0,
+            }
+            count = 0
+            start_time = time.time()
+
+        if is_main and args.sample_every > 0 and (step == 1 or step % args.sample_every == 0):
+            save_recon_grid(
+                out_dir / "samples" / f"step_{step:08d}.png",
+                x_lg,
+                x_rec,
+                x_mix_rec,
+                args.sample_images,
+                args.llamagen_input_range,
+            )
+
+        if is_main and args.save_every > 0 and step % args.save_every == 0:
+            core = model.module if distributed else model
+            core_d = discriminator.module if distributed and discriminator is not None else discriminator
+            payload = {
+                "model": core.trainable_state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "args": vars(args),
+                "step": step,
+                "lecam_ema_real": lecam_ema_real.detach().cpu(),
+                "lecam_ema_fake": lecam_ema_fake.detach().cpu(),
+            }
+            if ema is not None:
+                payload["model_ema"] = ema.state_dict()
+            if core_d is not None:
+                payload["discriminator"] = core_d.state_dict()
+            if optimizer_d is not None:
+                payload["optimizer_d"] = optimizer_d.state_dict()
+            torch.save(payload, out_dir / "latest.pt")
+            if args.save_step_checkpoints:
+                torch.save(payload, out_dir / f"step_{step:08d}.pt")
+
+    if is_main:
+        core = model.module if distributed else model
+        core_d = discriminator.module if distributed and discriminator is not None else discriminator
+        payload = {
+            "model": core.trainable_state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": vars(args),
+            "step": args.max_steps,
+            "lecam_ema_real": lecam_ema_real.detach().cpu(),
+            "lecam_ema_fake": lecam_ema_fake.detach().cpu(),
+        }
+        if ema is not None:
+            payload["model_ema"] = ema.state_dict()
+        if core_d is not None:
+            payload["discriminator"] = core_d.state_dict()
+        if optimizer_d is not None:
+            payload["optimizer_d"] = optimizer_d.state_dict()
+        torch.save(payload, out_dir / "latest.pt")
+        print(f"saved {out_dir / 'latest.pt'}", flush=True)
+    if distributed:
+        dist.destroy_process_group()
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--data-path", type=str, default="/var/tmp/heyefei_ImageNet/train")
+    parser.add_argument("--output-dir", type=str, default="results/titok_llamagen_recon_stage_a")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--reset-optimizer", action="store_true", default=False)
+    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--random-crop", action="store_true", default=False)
+    parser.add_argument("--random-flip", action="store_true", default=False)
+    parser.add_argument("--titok-input-range", type=str, default="zero_1", choices=["zero_1", "minus1_1"])
+    parser.add_argument("--llamagen-input-range", type=str, default="minus1_1", choices=["zero_1", "minus1_1"])
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--limit-samples", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr-d", type=float, default=1e-4)
+    parser.add_argument("--lr-scheduler", type=str, default="constant", choices=["constant", "cosine"])
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--min-lr", type=float, default=0.0)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["bf16", "fp16", "none"])
+    parser.add_argument("--use-ema", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--image-loss", type=str, default="l1", choices=["l1", "l2"])
+    parser.add_argument("--perceptual-loss", type=str, default="lpips", choices=["lpips", "convnext_s", "none"])
+    parser.add_argument("--lambda-perceptual", type=float, default=None)
+    parser.add_argument("--lambda-l1", type=float, default=1.0)
+    parser.add_argument("--lambda-lpips", type=float, default=0.5)
+    parser.add_argument("--lambda-feat", type=float, default=0.1)
+    parser.add_argument("--lambda-feat-moment", type=float, default=0.0)
+    parser.add_argument("--lambda-mix", type=float, default=0.0)
+    parser.add_argument("--lambda-gan", type=float, default=0.0)
+    parser.add_argument("--gan-start-step", type=int, default=20000)
+    parser.add_argument("--gan-ramp-steps", type=int, default=0)
+    parser.add_argument("--discriminator-factor", type=float, default=1.0)
+    parser.add_argument("--d-every", type=int, default=1)
+    parser.add_argument("--lecam-regularization-weight", type=float, default=0.001)
+    parser.add_argument("--lecam-ema-decay", type=float, default=0.999)
+    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "patch_dino"])
+    parser.add_argument("--disc-scales", type=float, nargs="*", default=[1.0])
+    parser.add_argument("--disc-loss-weights", type=float, nargs="*", default=[1.0])
+    parser.add_argument("--disc-hidden-channels", type=int, default=128)
+    parser.add_argument("--disc-num-stages", type=int, default=3)
+    parser.add_argument("--dino-repo", type=str, default="/home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main")
+    parser.add_argument("--dino-model", type=str, default="dinov2_vits14")
+    parser.add_argument("--dino-input-size", type=int, default=224)
+    parser.add_argument("--dino-loss-weight", type=float, default=0.25)
+    parser.add_argument("--dino-head-hidden", type=int, default=256)
+    parser.add_argument("--dino-use-patch-tokens", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mask-ratio-min", type=float, default=0.1)
+    parser.add_argument("--mask-ratio-max", type=float, default=0.9)
+    parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--save-step-checkpoints", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--sample-every", type=int, default=200)
+    parser.add_argument("--sample-images", type=int, default=8)
+    parser.add_argument("--lg-latent-channels", type=int, default=256)
+    parser.add_argument("--lg-head-channels", type=int, default=256)
+    parser.add_argument("--latent-head-mode", type=str, default="feature", choices=["feature", "codebook"])
+    parser.add_argument("--codebook-temperature", type=float, default=1.0)
+    parser.add_argument("--codebook-temperature-final", type=float, default=None)
+    parser.add_argument("--codebook-temperature-warmup-steps", type=int, default=0)
+    parser.add_argument("--lambda-codebook-entropy", type=float, default=0.0)
+    parser.add_argument("--codebook-entropy-target", type=float, default=0.0)
+    parser.add_argument("--lambda-codebook-ce", type=float, default=0.0)
+    parser.add_argument("--codebook-ce-label-smoothing", type=float, default=0.0)
+    parser.add_argument("--titok-root", type=str, default="/home/heyefei/lichenge/1d-tokenizer")
+    parser.add_argument("--titok-config", type=str, default="/home/heyefei/lichenge/1d-tokenizer/configs/infer/TiTok/titok_l32.yaml")
+    parser.add_argument("--titok-ckpt", type=str, default="/home/heyefei/lichenge/1d-tokenizer/tokenizer_titok_l32.bin")
+    parser.add_argument("--llamagen-root", type=str, default="/home/heyefei/lichenge/LlamaGen")
+    parser.add_argument("--llamagen-ckpt", type=str, default="/home/heyefei/lichenge/LlamaGen/pretrained_models/vq_ds16_c2i.pt")
+    parser.add_argument("--codebook-size", type=int, default=16384)
+    parser.add_argument("--codebook-embed-dim", type=int, default=8)
+    return parser
+
+
+def parse_args():
+    parser = build_parser()
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=str, default=None)
+    config_args, remaining = config_parser.parse_known_args()
+
+    defaults = vars(parser.parse_args([]))
+    config_values = {}
+    if config_args.config is not None:
+        config = OmegaConf.to_container(OmegaConf.load(config_args.config), resolve=True)
+        if not isinstance(config, dict):
+            raise ValueError(f"config must contain a mapping, got {type(config).__name__}")
+        config_values = {key.replace("-", "_"): value for key, value in config.items()}
+        unknown = sorted(set(config_values) - set(defaults))
+        if unknown:
+            raise ValueError(f"unknown config keys: {unknown}")
+
+    parser.set_defaults(**config_values)
+    args = parser.parse_args(remaining)
+    args.config = config_args.config
+    return args
+
+
+if __name__ == "__main__":
+    main(parse_args())
