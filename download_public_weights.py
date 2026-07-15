@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import os
 import shutil
 import sys
@@ -20,6 +21,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 
@@ -60,13 +62,33 @@ def download_url(url: str, dest: Path, expected_md5: str | None = None, retries:
                     raise RuntimeError(f'md5 mismatch for {dest}: got {got}, expected {expected_md5}')
             tmp.replace(dest)
             return
-        except (urllib.error.URLError, urllib.error.ContentTooShortError, RuntimeError) as exc:
+        except (urllib.error.URLError, urllib.error.ContentTooShortError, http.client.IncompleteRead, TimeoutError, RuntimeError) as exc:
             last_exc = exc
             tmp.unlink(missing_ok=True)
             if attempt < retries:
                 time.sleep(2 * attempt)
     raise RuntimeError(f'failed to download {url} after {retries} attempts: {last_exc}')
 
+
+
+def download_zip_extract(url: str, dest_dir: Path, strip_top_level: bool = True, retries: int = 8) -> None:
+    dest_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='mot_zip_') as tmp_name:
+        tmp_dir = Path(tmp_name)
+        archive = tmp_dir / 'archive.zip'
+        download_url(url, archive, retries=retries)
+        extract_root = tmp_dir / 'extract'
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(extract_root)
+        children = [p for p in extract_root.iterdir()]
+        src = children[0] if strip_top_level and len(children) == 1 and children[0].is_dir() else extract_root
+        tmp_dest = dest_dir.with_name(dest_dir.name + '.tmp')
+        if tmp_dest.exists():
+            shutil.rmtree(tmp_dest)
+        shutil.copytree(src, tmp_dest)
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        tmp_dest.replace(dest_dir)
 
 def download_hf(repo_id: str, filename: str, dest: Path, endpoint: str | None = None) -> None:
     try:
@@ -129,6 +151,12 @@ def public_weight_specs(project_root: Path, torch_cache_root: Path, hf_endpoint:
             'min_bytes': 1024 * 1024 * 200,
             'torch_load': True,
         },
+        'dinov2_repo': {
+            'path': torch_cache_root / 'hub' / 'facebookresearch_dinov2_main' / 'hubconf.py',
+            'download': lambda p: download_zip_extract('https://github.com/facebookresearch/dinov2/archive/refs/heads/main.zip', p.parent, retries=retries),
+            'min_bytes': 1024,
+            'torch_load': False,
+        },
         'dinov2_vits14': {
             'path': torch_cache_root / 'hub' / 'checkpoints' / 'dinov2_vits14_pretrain.pth',
             'download': lambda p: download_url('https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth', p, retries=retries),
@@ -151,7 +179,7 @@ def parse_args():
     parser.add_argument('--torch-cache-root', type=Path, default=Path("../.cache/torch"), help='Torch cache root containing hub/checkpoints.')
     parser.add_argument('--test', action='store_true', help='Download into a temp dir, validate, then delete it.')
     parser.add_argument('--test-dir', type=Path, default=None, help='Optional temp dir for --test.')
-    parser.add_argument('--only', nargs='*', default=None, help='Subset to download: titok_l32 llamagen_vq_ds16_c2i dinov2_vits14 lpips_vgg')
+    parser.add_argument('--only', nargs='*', default=None, help='Subset to download: titok_l32 llamagen_vq_ds16_c2i dinov2_repo dinov2_vits14 lpips_vgg')
     parser.add_argument('--hf-endpoint', default=os.environ.get('HF_ENDPOINT'), help='Optional HF endpoint, e.g. https://hf-mirror.com')
     parser.add_argument('--overwrite', action='store_true', help='Re-download existing files.')
     parser.add_argument('--retries', type=int, default=8, help='Retry count for direct URL downloads.')
