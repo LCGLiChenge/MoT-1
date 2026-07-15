@@ -116,8 +116,10 @@ dino_use_patch_tokens: true
 
 log_every: 50
 sample_every: 500
-save_every: 1000
-save_step_checkpoints: true
+save_every: 0
+latest_every_epoch: true
+save_epoch_every: 5
+save_step_checkpoints: false
 save_steps: []
 sample_images: 8
 

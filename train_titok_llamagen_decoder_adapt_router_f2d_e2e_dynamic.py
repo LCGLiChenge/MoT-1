@@ -669,6 +669,7 @@ def main(args):
         persistent_workers=args.num_workers > 0,
     )
     data_iter = cycle(loader, sampler)
+    steps_per_epoch = max(1, len(loader))
 
     titok = load_titok(args.titok_root, args.titok_config, args.titok_ckpt, device)
     vq_model = load_llamagen_vq(args.llamagen_root, args.llamagen_ckpt, device, args.codebook_size, args.codebook_embed_dim)
@@ -807,9 +808,12 @@ def main(args):
         core = model.module if distributed else model
         n_trainable = sum(p.numel() for p in core.parameters() if p.requires_grad)
         msg, run_header = format_run_header(args, len(dataset), world_size, n_trainable)
+        epoch_msg = f"steps_per_epoch={steps_per_epoch} latest_every_epoch={args.latest_every_epoch} save_epoch_every={args.save_epoch_every}"
         print(msg, flush=True)
+        print(epoch_msg, flush=True)
         with log_path.open("a") as f:
             f.write(run_header)
+            f.write(epoch_msg + "\n")
 
     running = {
         "loss": 0.0,
@@ -1320,10 +1324,23 @@ def main(args):
             )
 
         save_steps = set(args.save_steps)
-        save_latest_due = args.save_every > 0 and step % args.save_every == 0
-        save_periodic_step_due = save_latest_due and args.save_step_checkpoints
-        save_step_due = save_periodic_step_due or step in save_steps
-        if is_main and (save_latest_due or save_step_due):
+        trained_steps = step - start_step
+        epoch_boundary_due = (
+            args.latest_every_epoch
+            and trained_steps > 0
+            and trained_steps % steps_per_epoch == 0
+        )
+        completed_epochs = trained_steps // steps_per_epoch if trained_steps > 0 else 0
+        save_epoch_due = (
+            args.save_epoch_every > 0
+            and epoch_boundary_due
+            and completed_epochs > 0
+            and completed_epochs % args.save_epoch_every == 0
+        )
+        save_latest_due = (args.save_every > 0 and step % args.save_every == 0) or epoch_boundary_due
+        save_periodic_step_due = args.save_step_checkpoints and args.save_every > 0 and step % args.save_every == 0
+        save_explicit_step_due = step in save_steps
+        if is_main and (save_latest_due or save_periodic_step_due or save_explicit_step_due or save_epoch_due):
             core = model.module if distributed else model
             payload = {
                 "model": collect_trainable_state(core),
@@ -1343,8 +1360,10 @@ def main(args):
                 payload["optimizer_d"] = optimizer_d.state_dict()
             if save_latest_due:
                 torch.save(payload, out_dir / "latest.pt")
-            if save_step_due:
+            if save_periodic_step_due or save_explicit_step_due:
                 torch.save(payload, out_dir / f"step_{step:08d}.pt")
+            if save_epoch_due:
+                torch.save(payload, out_dir / f"epoch_{completed_epochs:04d}_step_{step:08d}.pt")
 
     if is_main:
         pbar.close()
@@ -1487,6 +1506,8 @@ def build_parser():
     parser.add_argument("--router-only-disable-gan", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--latest-every-epoch", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--save-epoch-every", type=int, default=0)
     parser.add_argument("--save-step-checkpoints", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-steps", type=int, nargs="*", default=[])
     parser.add_argument("--sample-every", type=int, default=200)
