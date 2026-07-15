@@ -195,7 +195,7 @@ dependencies:
       - torchmetrics==1.8.2
       - torchvision==0.25.0
       - tqdm==4.67.1
-      - transformers==4.50.0.dev0
+      - transformers @ git+https://github.com/huggingface/transformers@a957b7911a758d54597914b4479fe6e81424d64f
       - triton==3.6.0
       - typer-slim==0.21.1
       - typing-extensions==4.15.0
