@@ -644,6 +644,41 @@ def compute_path_losses(perceptual, perceptual_name, pred, target, image_loss):
     return image, perc, mse01
 
 
+
+def init_wandb_run(args, out_dir, dataset_len, world_size, trainable_count, is_main):
+    if not is_main or not args.wandb:
+        return None
+    try:
+        import wandb
+    except Exception as exc:
+        print(f"wandb disabled: failed to import wandb ({exc})", flush=True)
+        return None
+
+    config = vars(args).copy()
+    config.update({
+        "dataset_len": dataset_len,
+        "world_size": world_size,
+        "global_batch_size": args.batch_size * world_size * args.accum_steps,
+        "trainable_params": trainable_count,
+    })
+    kwargs = {
+        "project": args.wandb_project,
+        "name": args.wandb_name or out_dir.name,
+        "config": config,
+        "dir": str(out_dir),
+    }
+    if args.wandb_entity:
+        kwargs["entity"] = args.wandb_entity
+    if args.wandb_mode:
+        kwargs["mode"] = args.wandb_mode
+    if args.wandb_tags:
+        kwargs["tags"] = args.wandb_tags
+    try:
+        return wandb.init(**kwargs)
+    except Exception as exc:
+        print(f"wandb disabled: init failed ({exc})", flush=True)
+        return None
+
 def main(args):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for training")
@@ -804,6 +839,7 @@ def main(args):
         dist.barrier()
     log_path = out_dir / "log.txt"
 
+    n_trainable = 0
     if is_main:
         core = model.module if distributed else model
         n_trainable = sum(p.numel() for p in core.parameters() if p.requires_grad)
@@ -814,6 +850,8 @@ def main(args):
         with log_path.open("a") as f:
             f.write(run_header)
             f.write(epoch_msg + "\n")
+
+    wandb_run = init_wandb_run(args, out_dir, len(dataset), world_size, n_trainable, is_main)
 
     running = {
         "loss": 0.0,
@@ -1308,6 +1346,20 @@ def main(args):
             )
             with log_path.open("a") as f:
                 f.write(msg + "\n")
+            if wandb_run is not None:
+                log_metrics = {f"train/{key}": running[key] / denom for key in keys}
+                log_metrics.update({
+                    "train/base_psnr": -10.0 * math.log10(max(base_mse, 1e-12)),
+                    "train/mix_psnr": -10.0 * math.log10(max(mix_mse, 1e-12)),
+                    "train/native_psnr": -10.0 * math.log10(max(native_mse, 1e-12)),
+                    "train/lr": current_lr,
+                    "train/lr_lg": current_lr_lg,
+                    "train/lr_router": compute_lr(args, step, base_lr=args.lr_router),
+                    "train/lr_d": current_lr_d,
+                    "train/sec_per_step": sec,
+                    "train/phase_router_only": float(router_only_active),
+                })
+                wandb_run.log(log_metrics, step=step)
             running = {key: 0.0 for key in running}
             count = 0
             start_time = time.time()
@@ -1386,6 +1438,8 @@ def main(args):
             payload["optimizer_d"] = optimizer_d.state_dict()
         torch.save(payload, out_dir / "latest.pt")
         print(f"saved {out_dir / 'latest.pt'}", flush=True)
+    if wandb_run is not None:
+        wandb_run.finish()
     if distributed:
         dist.destroy_process_group()
 
@@ -1504,6 +1558,12 @@ def build_parser():
     parser.add_argument("--router-ratio-target-spread", type=float, default=0.0)
     parser.add_argument("--router-only-steps", type=int, default=0)
     parser.add_argument("--router-only-disable-gan", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--wandb-project", type=str, default="MoT")
+    parser.add_argument("--wandb-name", type=str, default="")
+    parser.add_argument("--wandb-entity", type=str, default="")
+    parser.add_argument("--wandb-mode", type=str, default="")
+    parser.add_argument("--wandb-tags", nargs="*", default=[])
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--latest-every-epoch", action=argparse.BooleanOptionalAction, default=False)

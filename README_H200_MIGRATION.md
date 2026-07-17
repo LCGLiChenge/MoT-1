@@ -2,31 +2,30 @@
 
 Current package source: `../Mixture-of-Tokenizer/version4`
 
-Main training config:
+Main resume config:
 
 ```bash
-configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch.yaml
+configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml
 ```
 
 Launch command for 8 H200 GPUs:
 
 ```bash
 cd MoT
+wandb login
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
-  --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch.yaml
+  --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml
 ```
 
-The config assumes 8 GPUs, `batch_size=32`, `accum_steps=1`, global batch 256. With 1,281,167 train images, 10 epochs are about 50,050 optimizer steps, so from step 94,000 the target `max_steps` is 144,050.
+The config assumes 8 GPUs, `batch_size=32`, `accum_steps=1`, global batch 256, and resumes from `weights/epoch_0005_step_00127360.pt`. `max_steps=144050` continues the original from-94000 H200 schedule; raise it if more epochs are needed.
 
 Expected local checkpoint layout:
 
 ```text
 weights/step_00066000.pt
-weights/step_00094000.pt
+weights/epoch_0005_step_00127360.pt
 ```
-
-External dependencies and weights must also exist on the H200 machine, or the paths in the config must be changed.
 
 Public pretrained weights download:
 
@@ -35,21 +34,14 @@ cd MoT
 python download_public_weights.py --project-root .. --torch-cache-root ../.cache/torch --hf-endpoint https://hf-mirror.com
 ```
 
-This downloads only public pretrained dependencies:
+Trained checkpoint download:
 
-```text
-1d-tokenizer/tokenizer_titok_l32.bin
-LlamaGen/pretrained_models/vq_ds16_c2i.pt
-.cache/torch/hub/checkpoints/dinov2_vits14_pretrain.pth
-LlamaGen/tokenizer/tokenizer_image/cache/vgg.pth
+```bash
+HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 weights/step_00066000.pt --repo-type model --local-dir .
+HF_HUB_DISABLE_XET=1 hf download sophiaa/MoT-1-checkpoints epoch_0005_step_00127360.pt --repo-type model --local-dir weights
 ```
 
-It does not download our trained checkpoints. Those still need to be copied manually:
-
-```text
-weights/step_00066000.pt
-weights/step_00094000.pt
-```
+Wandb is enabled in the resume yaml. If the H200 machine cannot access wandb, either set `WANDB_MODE=offline` before launch or pass `--no-wandb`.
 
 Download script test mode:
 

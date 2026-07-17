@@ -46,22 +46,25 @@ python download_public_weights.py \
 
 ## 4. Pull MoT checkpoints
 
-```bash
-HF_HUB_ENABLE_HF_TRANSFER=1 hf download Chloeeeeeeee123/MoT-1 \
-  weights/step_00066000.pt \
-  weights/step_00094000.pt \
-  --repo-type model \
-  --local-dir .
+The resume config expects the 66k adapter init and the epoch5 resume checkpoint here:
+
+```text
+weights/step_00066000.pt
+weights/epoch_0005_step_00127360.pt
 ```
 
-If the network is unstable, retry with resumable HTTP:
+Download them with:
 
 ```bash
 HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 \
   weights/step_00066000.pt \
-  weights/step_00094000.pt \
   --repo-type model \
   --local-dir .
+
+HF_HUB_DISABLE_XET=1 hf download sophiaa/MoT-1-checkpoints \
+  epoch_0005_step_00127360.pt \
+  --repo-type model \
+  --local-dir weights
 ```
 
 ## 5. Smoke test
@@ -74,27 +77,33 @@ path all work.
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 \
 torchrun --standalone --nproc_per_node=1 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
-  --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch.yaml \
+  --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml \
   --batch-size 1 \
   --limit-samples 8 \
   --num-workers 0 \
-  --max-steps 94001 \
+  --max-steps 127361 \
   --log-every 1 \
   --sample-every 0 \
   --sample-images 0 \
   --save-every 0 \
   --no-latest-every-epoch \
   --save-epoch-every 0 \
+  --no-wandb \
   --output-dir results/smoke_mot1
 ```
 
 ## 6. Train on 8 H200 GPUs
 
 ImageNet train should be available at `../ImageNet/train` relative to `MoT-1`;
-use a symlink if needed.
+use a symlink if needed. The config enables wandb and names the run
+`mot_h200_epoch5_resume_from127360`.
 
 ```bash
+wandb login
+
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
-  --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from94000_h200_8gpu_10epoch.yaml
+  --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml
 ```
+
+This resumes model, optimizer, discriminator, and EMA from `weights/epoch_0005_step_00127360.pt`. It updates `latest.pt` every epoch and saves an extra epoch checkpoint every 5 epochs. To train beyond the original schedule, raise `max_steps` in the yaml.
