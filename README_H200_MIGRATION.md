@@ -12,10 +12,13 @@ Launch command for 8 H200 GPUs:
 
 ```bash
 cd MoT
-wandb login
+read -rsp "WANDB_API_KEY: " WANDB_API_KEY; echo
+export WANDB_API_KEY
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
   --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml
+unset WANDB_API_KEY
+wandb logout
 ```
 
 The config assumes 8 GPUs, `batch_size=32`, `accum_steps=1`, global batch 256, and resumes from `weights/epoch_0005_step_00127360.pt`. `max_steps=144050` continues the original from-94000 H200 schedule; raise it if more epochs are needed.
@@ -41,7 +44,7 @@ HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 weights/step_00066000.pt 
 HF_HUB_DISABLE_XET=1 hf download sophiaa/MoT-1-checkpoints epoch_0005_step_00127360.pt --repo-type model --local-dir weights
 ```
 
-Wandb is enabled in the resume yaml. If the H200 machine cannot access wandb, either set `WANDB_MODE=offline` before launch or pass `--no-wandb`.
+Wandb is enabled in the resume yaml. Keep the API key out of yaml/git and pass it through `WANDB_API_KEY`. If a specific team/user is needed, set `wandb_entity` in the yaml or pass `--wandb-entity ENTITY`. If the H200 machine cannot access wandb, either set `WANDB_MODE=offline` before launch or pass `--no-wandb`.
 
 Download script test mode:
 

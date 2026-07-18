@@ -96,14 +96,25 @@ torchrun --standalone --nproc_per_node=1 train_titok_llamagen_decoder_adapt_rout
 
 ImageNet train should be available at `../ImageNet/train` relative to `MoT-1`;
 use a symlink if needed. The config enables wandb and names the run
-`mot_h200_epoch5_resume_from127360`.
+`mot_h200_epoch5_resume_from127360`. Do not put the wandb API key into yaml or git.
+
+Use your wandb key through an environment variable so the remote server logs to
+your account:
 
 ```bash
-wandb login
+read -rsp "WANDB_API_KEY: " WANDB_API_KEY; echo
+export WANDB_API_KEY
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
   --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml
+
+unset WANDB_API_KEY
+wandb logout
 ```
+
+If wandb should write to a specific team/user entity, set `wandb_entity` in the
+yaml or pass `--wandb-entity ENTITY`. If the server cannot access wandb, set
+`WANDB_MODE=offline` before launch or pass `--no-wandb`.
 
 This resumes model, optimizer, discriminator, and EMA from `weights/epoch_0005_step_00127360.pt`. It updates `latest.pt` every epoch and saves an extra epoch checkpoint every 5 epochs. To train beyond the original schedule, raise `max_steps` in the yaml.

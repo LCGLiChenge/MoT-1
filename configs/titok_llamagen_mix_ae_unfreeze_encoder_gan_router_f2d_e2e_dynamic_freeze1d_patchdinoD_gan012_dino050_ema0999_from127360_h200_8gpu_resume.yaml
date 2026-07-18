@@ -126,6 +126,8 @@ sample_images: 0
 wandb: true
 wandb_project: MoT
 wandb_name: mot_h200_epoch5_resume_from127360
+wandb_entity: ""
+wandb_mode: ""
 wandb_tags: [h200, resume, epoch5, patchdinoD, ema0999]
 
 lg_latent_channels: 256
