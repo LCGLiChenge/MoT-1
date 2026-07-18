@@ -1,6 +1,6 @@
 # H200 8-GPU EMA continuation from epoch_0005_step_00127360.pt.
 # Keeps the frozen 1D adapter and Router fixed, resumes model/optimizer/D/EMA state,
-# and continues the original decoder-only patch+DINO-D schedule to max_steps=144050.
+# and continues decoder-only patch+DINO-D training for about 3 epochs to max_steps=142375.
 # Launch with 8 H200 GPUs:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 #   torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
@@ -24,7 +24,7 @@ random_crop: false
 random_flip: false
 batch_size: 32
 accum_steps: 1
-max_steps: 144050
+max_steps: 142375
 num_workers: 12
 limit_samples: 0
 

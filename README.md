@@ -116,4 +116,4 @@ If wandb should write to a specific team/user entity, set `wandb_entity` in the
 yaml or pass `--wandb-entity ENTITY`. If the server cannot access wandb, set
 `WANDB_MODE=offline` before launch or pass `--no-wandb`.
 
-This resumes model, optimizer, discriminator, and EMA from `weights/epoch_0005_step_00127360.pt`. It updates `latest.pt` every epoch and saves an extra epoch checkpoint every 5 epochs. To train beyond the original schedule, raise `max_steps` in the yaml.
+This resumes model, optimizer, discriminator, and EMA from `weights/epoch_0005_step_00127360.pt`, then trains about 3 more epochs to `max_steps=142375`. It updates `latest.pt` every epoch. Because `save_epoch_every=5`, this 3-epoch continuation will not create an extra epoch checkpoint unless you raise `max_steps`.

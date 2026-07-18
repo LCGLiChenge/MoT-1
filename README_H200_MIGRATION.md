@@ -21,7 +21,7 @@ unset WANDB_API_KEY
 wandb logout
 ```
 
-The config assumes 8 GPUs, `batch_size=32`, `accum_steps=1`, global batch 256, and resumes from `weights/epoch_0005_step_00127360.pt`. `max_steps=144050` continues the original from-94000 H200 schedule; raise it if more epochs are needed.
+The config assumes 8 GPUs, `batch_size=32`, `accum_steps=1`, global batch 256, and resumes from `weights/epoch_0005_step_00127360.pt`. `max_steps=142375` continues for about 3 epochs from step 127360; raise it if more epochs are needed.
 
 Expected local checkpoint layout:
 
