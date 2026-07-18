@@ -66,12 +66,58 @@ HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 \
   --local-dir .
 ```
 
-## 5. Smoke test
+## 5. Configure wandb
+
+The training config has wandb enabled:
+
+```yaml
+wandb: true
+wandb_project: MoT
+wandb_name: mot_h200_epoch5_resume_from127360
+```
+
+Use the owner's wandb API key so runs from the remote server appear in the
+owner's wandb account. Get the key from this page while logged into wandb:
+
+```text
+https://wandb.ai/authorize
+```
+
+On the training server, enter the key without printing it to the terminal:
+
+```bash
+read -rsp "WANDB_API_KEY: " WANDB_API_KEY; echo
+export WANDB_API_KEY
+```
+
+Do not write the API key into yaml, README, shell scripts, GitHub, or shared
+logs. If the run should go to a specific team/user entity, set `wandb_entity` in
+the yaml or pass `--wandb-entity ENTITY`.
+
+When training starts, wandb should print a project URL and a run URL. Open that
+run URL in a browser to watch curves and console logs. After training finishes,
+clear the key from the shell:
+
+```bash
+unset WANDB_API_KEY
+wandb logout
+```
+
+If the server cannot access wandb, use offline logging:
+
+```bash
+export WANDB_MODE=offline
+```
+
+Then sync later with `wandb sync path/to/wandb/offline-run-*`. To disable wandb
+for smoke tests, pass `--no-wandb`.
+
+## 6. Smoke test
 
 ImageNet train should be available at `../ImageNet/train` relative to `MoT-1`;
 use a symlink if needed. This command runs one training step on one GPU and
 checks that the downloaded weights, imports, dataloader, resume path, and save
-path all work.
+path all work. It disables wandb so the smoke test does not create a real run.
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 \
@@ -91,29 +137,18 @@ torchrun --standalone --nproc_per_node=1 train_titok_llamagen_decoder_adapt_rout
   --output-dir results/smoke_mot1
 ```
 
-## 6. Train on 8 H200 GPUs
+## 7. Train on 8 H200 GPUs
 
 ImageNet train should be available at `../ImageNet/train` relative to `MoT-1`;
-use a symlink if needed. The config enables wandb and names the run
-`mot_h200_epoch5_resume_from127360`. Do not put the wandb API key into yaml or git.
-
-Use your wandb key through an environment variable so the remote server logs to
-your account:
+use a symlink if needed. Run the wandb setup in step 5 first, then launch:
 
 ```bash
-read -rsp "WANDB_API_KEY: " WANDB_API_KEY; echo
-export WANDB_API_KEY
-
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
   --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml
-
-unset WANDB_API_KEY
-wandb logout
 ```
 
-If wandb should write to a specific team/user entity, set `wandb_entity` in the
-yaml or pass `--wandb-entity ENTITY`. If the server cannot access wandb, set
-`WANDB_MODE=offline` before launch or pass `--no-wandb`.
+The terminal should print a wandb run URL after resume loading. Keep that URL for
+monitoring the run from another machine.
 
 This resumes model, optimizer, discriminator, and EMA from `weights/epoch_0005_step_00127360.pt`, then trains about 3 more epochs to `max_steps=142375`. It updates `latest.pt` every epoch and saves one extra epoch checkpoint at the end because `save_epoch_every=3`.

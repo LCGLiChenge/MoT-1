@@ -8,15 +8,34 @@ Main resume config:
 configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml
 ```
 
+Wandb setup:
+
+1. Get the owner's wandb API key from `https://wandb.ai/authorize`.
+2. On the H200 server, enter it without printing it to the terminal:
+
+```bash
+read -rsp "WANDB_API_KEY: " WANDB_API_KEY; echo
+export WANDB_API_KEY
+```
+
+The resume yaml enables wandb with project `MoT` and run name
+`mot_h200_epoch5_resume_from127360`. Do not write the API key into yaml, README,
+shell scripts, GitHub, or shared logs. If the run should go to a specific
+team/user entity, set `wandb_entity` in the yaml or pass `--wandb-entity ENTITY`.
+
 Launch command for 8 H200 GPUs:
 
 ```bash
 cd MoT
-read -rsp "WANDB_API_KEY: " WANDB_API_KEY; echo
-export WANDB_API_KEY
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
   --config configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_dino050_ema0999_from127360_h200_8gpu_resume.yaml
+```
+
+The terminal should print a wandb project URL and run URL. After training
+finishes, clear the key from the shell:
+
+```bash
 unset WANDB_API_KEY
 wandb logout
 ```
@@ -49,7 +68,7 @@ HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 \
   --local-dir .
 ```
 
-Wandb is enabled in the resume yaml. Keep the API key out of yaml/git and pass it through `WANDB_API_KEY`. If a specific team/user is needed, set `wandb_entity` in the yaml or pass `--wandb-entity ENTITY`. If the H200 machine cannot access wandb, either set `WANDB_MODE=offline` before launch or pass `--no-wandb`.
+If the H200 machine cannot access wandb, set `WANDB_MODE=offline` before launch and sync later with `wandb sync path/to/wandb/offline-run-*`. To disable wandb for tests, pass `--no-wandb`.
 
 Download script test mode:
 
