@@ -76,14 +76,9 @@ wandb_project: MoT
 wandb_name: mot_h200_epoch5_resume_from127360
 ```
 
-Use the owner's wandb API key so runs from the remote server appear in the
-owner's wandb account. Get the key from this page while logged into wandb:
-
-```text
-https://wandb.ai/authorize
-```
-
-On the training server, enter the key without printing it to the terminal:
+Use the wandb API key provided by the project owner so runs from the remote
+server appear in the owner's wandb account. On the training server, enter the key
+without printing it to the terminal:
 
 ```bash
 read -rsp "WANDB_API_KEY: " WANDB_API_KEY; echo

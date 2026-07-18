@@ -10,7 +10,7 @@ configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze
 
 Wandb setup:
 
-1. Get the owner's wandb API key from `https://wandb.ai/authorize`.
+1. Use the wandb API key provided by the project owner.
 2. On the H200 server, enter it without printing it to the terminal:
 
 ```bash
