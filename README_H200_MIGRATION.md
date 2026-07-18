@@ -30,18 +30,23 @@ weights/step_00066000.pt
 weights/epoch_0005_step_00127360.pt
 ```
 
-Public pretrained weights download:
+If any public pretrained weight is missing, run:
 
 ```bash
 cd MoT
 python download_public_weights.py --project-root .. --torch-cache-root ../.cache/torch --hf-endpoint https://hf-mirror.com
 ```
 
-Trained checkpoint download:
+This covers the TiTok checkpoint, LlamaGen VQ checkpoint, DINOv2 checkpoint, and LPIPS VGG checkpoint.
+
+If either trained checkpoint is missing locally, pull both from Hugging Face:
 
 ```bash
-HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 weights/step_00066000.pt --repo-type model --local-dir .
-HF_HUB_DISABLE_XET=1 hf download sophiaa/MoT-1-checkpoints epoch_0005_step_00127360.pt --repo-type model --local-dir weights
+HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 \
+  weights/step_00066000.pt \
+  weights/epoch_0005_step_00127360.pt \
+  --repo-type model \
+  --local-dir .
 ```
 
 Wandb is enabled in the resume yaml. Keep the API key out of yaml/git and pass it through `WANDB_API_KEY`. If a specific team/user is needed, set `wandb_entity` in the yaml or pass `--wandb-entity ENTITY`. If the H200 machine cannot access wandb, either set `WANDB_MODE=offline` before launch or pass `--no-wandb`.

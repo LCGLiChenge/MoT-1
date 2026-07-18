@@ -35,7 +35,7 @@ If the source trees live elsewhere, keep the downloaded weights in the paths
 above and pass `--titok-root`, `--titok-config`, and `--llamagen-root` to the
 training command.
 
-Download the public weights:
+If any public weight file is missing, run the download script:
 
 ```bash
 python download_public_weights.py \
@@ -43,6 +43,9 @@ python download_public_weights.py \
   --torch-cache-root ../.cache/torch \
   --hf-endpoint https://hf-mirror.com
 ```
+
+This covers the TiTok checkpoint, LlamaGen VQ checkpoint, DINOv2 checkpoint, and
+LPIPS VGG checkpoint. It does not download our trained MoT checkpoints.
 
 ## 4. Pull MoT checkpoints
 
@@ -53,18 +56,14 @@ weights/step_00066000.pt
 weights/epoch_0005_step_00127360.pt
 ```
 
-Download them with:
+If either trained checkpoint is missing locally, pull both from Hugging Face:
 
 ```bash
 HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 \
   weights/step_00066000.pt \
+  weights/epoch_0005_step_00127360.pt \
   --repo-type model \
   --local-dir .
-
-HF_HUB_DISABLE_XET=1 hf download sophiaa/MoT-1-checkpoints \
-  epoch_0005_step_00127360.pt \
-  --repo-type model \
-  --local-dir weights
 ```
 
 ## 5. Smoke test
