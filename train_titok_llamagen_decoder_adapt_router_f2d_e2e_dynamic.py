@@ -1135,6 +1135,15 @@ def main(args):
                     + router_aux_weight * router_aux_loss
                 )
 
+            if args.train_llamagen_quantizer and hasattr(core.llamagen_vq, "quantize"):
+                quantizer_zero_loss = None
+                for quantizer_param in core.llamagen_vq.quantize.parameters():
+                    if quantizer_param.requires_grad:
+                        quantizer_term = quantizer_param.float().sum() * 0.0
+                        quantizer_zero_loss = quantizer_term if quantizer_zero_loss is None else quantizer_zero_loss + quantizer_term
+                if quantizer_zero_loss is not None:
+                    loss = loss + quantizer_zero_loss
+
             (loss / args.accum_steps).backward()
 
             d_loss = x_mix.new_zeros(())
