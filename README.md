@@ -73,7 +73,7 @@ The training config has wandb enabled:
 ```yaml
 wandb: true
 wandb_project: MoT
-wandb_name: mot_h200_epoch5_resume_from127360
+wandb_name: mot_h200_epoch5_resume_5epoch_unfreeze2dquant
 ```
 
 Use the wandb API key provided by the project owner so runs from the remote
@@ -146,4 +146,4 @@ torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_rout
 The terminal should print a wandb run URL after resume loading. Keep that URL for
 monitoring the run from another machine.
 
-This resumes model, optimizer, discriminator, and EMA from `weights/epoch_0005_step_00127360.pt`, then trains about 3 more epochs to `max_steps=142375`. It updates `latest.pt` every epoch and saves one extra epoch checkpoint at the end because `save_epoch_every=3`.
+This resumes model, discriminator, and EMA from `weights/epoch_0005_step_00127360.pt` and resets the optimizer because the 2D quantizer/codebook is newly trainable, keeps the 1D adapter and Router frozen, enables low-lr 2D quantizer/codebook tuning, then trains about 5 more epochs to `max_steps=152385`. It updates `latest.pt` every epoch and saves one extra epoch checkpoint at the end because `save_epoch_every=5`.

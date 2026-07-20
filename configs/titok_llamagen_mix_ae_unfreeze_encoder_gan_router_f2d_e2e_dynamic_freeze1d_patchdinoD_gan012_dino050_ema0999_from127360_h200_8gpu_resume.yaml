@@ -1,6 +1,6 @@
 # H200 8-GPU EMA continuation from epoch_0005_step_00127360.pt.
-# Keeps the frozen 1D adapter and Router fixed, resumes model/optimizer/D/EMA state,
-# and continues decoder-only patch+DINO-D training for about 3 epochs to max_steps=142375.
+# Keeps the frozen 1D adapter and Router fixed, resumes model/D/EMA state and resets optimizer,
+# and continues low-lr 2D tokenizer+decoder patch+DINO-D training for about 5 epochs to max_steps=152385.
 # Launch with 8 H200 GPUs:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 #   torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
@@ -13,7 +13,7 @@ adapter_init: weights/step_00066000.pt
 adapter_init_ema: true
 resume: weights/epoch_0005_step_00127360.pt
 resume_non_strict: true
-reset_optimizer: false
+reset_optimizer: true
 reset_discriminator: false
 reset_selector_state: false
 
@@ -24,14 +24,14 @@ random_crop: false
 random_flip: false
 batch_size: 32
 accum_steps: 1
-max_steps: 142375
+max_steps: 152385
 num_workers: 12
 limit_samples: 0
 
 train_adapter: false
 train_llamagen_encoder: true
 train_llamagen_quant_conv: true
-train_llamagen_quantizer: false
+train_llamagen_quantizer: true
 train_post_quant_conv: true
 train_llamagen_decoder: true
 train_router: true
@@ -118,17 +118,17 @@ log_every: 50
 sample_every: 0
 save_every: 0
 latest_every_epoch: true
-save_epoch_every: 3
+save_epoch_every: 5
 save_step_checkpoints: false
 save_steps: []
 sample_images: 0
 
 wandb: true
 wandb_project: MoT
-wandb_name: mot_h200_epoch5_resume_from127360
+wandb_name: mot_h200_epoch5_resume_5epoch_unfreeze2dquant
 wandb_entity: ""
 wandb_mode: ""
-wandb_tags: [h200, resume, epoch5, patchdinoD, ema0999]
+wandb_tags: [h200, resume, epoch5, patchdinoD, ema0999, unfreeze2dquant]
 
 lg_latent_channels: 256
 lg_head_channels: 256
