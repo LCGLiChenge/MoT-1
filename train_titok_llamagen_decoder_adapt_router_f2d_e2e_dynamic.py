@@ -29,6 +29,7 @@ from train_titok_llamagen_recon import (
     adamw_param_groups,
     autocast_dtype,
     build_discriminator,
+    build_dino_feature_loss,
     build_perceptual_loss,
     chw_to_pil,
     compute_feature_moment_loss,
@@ -66,7 +67,8 @@ def format_run_header(args, dataset_len, world_size, trainable_params):
         f"loss=image({args.image_loss}) base:{args.lambda_base},mix:{args.lambda_mix},native:{args.lambda_native},"
         f"mix_native:{args.lambda_mix_native}@{args.lambda_mix_native_perceptual}/{args.mix_native_teacher},"
         f"perceptual({args.perceptual_loss}):{get_perceptual_weight(args)},feat:{args.lambda_feat},"
-        f"feat_moment:{args.lambda_feat_moment} gan:{args.lambda_gan}@{args.gan_start_step}+ramp{args.gan_ramp_steps},"
+        f"feat_moment:{args.lambda_feat_moment},dino_feat:{args.lambda_dino_feat}/{args.dino_feat_loss},"
+        f"gan:{args.lambda_gan}@{args.gan_start_step}+ramp{args.gan_ramp_steps},"
         f"disc:{args.discriminator_type}/scales={args.disc_scales}/weights={args.disc_loss_weights},"
         f"dino:{args.dino_model}@{args.dino_loss_weight},"
         f"d_every:{args.d_every},d_warmup:{args.d_warmup_steps},lecam:{args.lecam_regularization_weight} "
@@ -721,6 +723,7 @@ def main(args):
         )
         native_teacher_vq.eval().requires_grad_(False)
     perceptual = build_perceptual_loss(args, device)
+    dino_feature_loss = build_dino_feature_loss(args, device)
 
     model = TiTokLlamaGenStage2(
         titok,
@@ -868,6 +871,7 @@ def main(args):
         "native_mse01": 0.0,
         "feat": 0.0,
         "feat_moment": 0.0,
+        "dino_feat": 0.0,
         "gan_g": 0.0,
         "d_loss": 0.0,
         "lecam": 0.0,
@@ -1090,6 +1094,14 @@ def main(args):
                 )
                 feat_loss = F.l1_loss(f_1d_lg.float(), f_2d_lg.detach().float())
                 feat_moment = compute_feature_moment_loss(f_1d_lg.float(), f_2d_lg.detach().float())
+                dino_feat_loss = x_mix.new_zeros(())
+                if dino_feature_loss is not None and float(args.lambda_dino_feat) > 0.0:
+                    dino_feat_loss = dino_feature_loss(
+                        x_mix,
+                        x_lg,
+                        pred_range=args.llamagen_input_range,
+                        target_range=args.llamagen_input_range,
+                    )
                 router_aux_weight = float(args.router_gain_aux_weight)
                 if args.router_gain_aux_decay_steps > 0:
                     router_aux_weight *= max(0.0, 1.0 - float(step - start_step) / float(args.router_gain_aux_decay_steps))
@@ -1128,6 +1140,7 @@ def main(args):
                     + mix_native_loss
                     + args.lambda_feat * feat_loss
                     + args.lambda_feat_moment * feat_moment
+                    + args.lambda_dino_feat * dino_feat_loss
                     + args.lambda_gan * gan_factor * gan_g_loss
                     + args.lambda_router_budget * router_budget_loss
                     + args.lambda_router_binary * router_binary_loss
@@ -1185,6 +1198,7 @@ def main(args):
             metric_sums["native_mse01"] += native_mse01.detach().float().item()
             metric_sums["feat"] += feat_loss.detach().float().item()
             metric_sums["feat_moment"] += feat_moment.detach().float().item()
+            metric_sums["dino_feat"] += dino_feat_loss.detach().float().item()
             metric_sums["gan_g"] += (args.lambda_gan * gan_factor * gan_g_loss).detach().float().item()
             metric_sums["d_loss"] += d_loss.detach().float().item()
             metric_sums["lecam"] += lecam_loss.detach().float().item()
@@ -1241,6 +1255,7 @@ def main(args):
                 metric_sums["native_mse01"] / args.accum_steps,
                 metric_sums["feat"] / args.accum_steps,
                 metric_sums["feat_moment"] / args.accum_steps,
+                metric_sums["dino_feat"] / args.accum_steps,
                 metric_sums["gan_g"] / args.accum_steps,
                 metric_sums["d_loss"] / args.accum_steps,
                 metric_sums["lecam"] / args.accum_steps,
@@ -1276,7 +1291,7 @@ def main(args):
         keys = [
             "loss", "base", "base_lp", "base_mse01", "mix", "mix_lp", "mix_mse01",
             "mix_native", "mix_native_lp",
-            "native", "native_lp", "native_mse01", "feat", "feat_moment",
+            "native", "native_lp", "native_mse01", "feat", "feat_moment", "dino_feat",
             "gan_g", "d_loss", "lecam", "logits_real", "logits_fake",
             "mask", "mask_tokens", "mask_tokens_std", "mask_tokens_min", "mask_tokens_max",
             "score", "score_error", "score_gradient", "score_variance",
@@ -1341,7 +1356,8 @@ def main(args):
                 f"mix {running['mix']/denom:.5f} lp {running['mix_lp']/denom:.5f} psnr {(-10.0 * math.log10(max(mix_mse, 1e-12))):.2f} | "
                 f"native {running['native']/denom:.5f} lp {running['native_lp']/denom:.5f} psnr {(-10.0 * math.log10(max(native_mse, 1e-12))):.2f} | "
                 f"mix_native {running['mix_native']/denom:.5f} lp {running['mix_native_lp']/denom:.5f} | "
-                f"feat {running['feat']/denom:.5f} feat_moment {running['feat_moment']/denom:.5f} | "
+                f"feat {running['feat']/denom:.5f} feat_moment {running['feat_moment']/denom:.5f} "
+                f"dino_feat {running['dino_feat']/denom:.5f} | "
                 f"gan_g {running['gan_g']/denom:.5f} | d {running['d_loss']/denom:.5f} | "
                 f"router_budget {running['router_budget']/denom:.5f} router_binary {running['router_binary']/denom:.5f} "
                 f"router_aux {running['router_aux']/denom:.5f} "
@@ -1509,6 +1525,11 @@ def build_parser():
     parser.add_argument("--mix-native-teacher", type=str, default="shared", choices=["shared", "frozen"])
     parser.add_argument("--lambda-feat", type=float, default=0.0)
     parser.add_argument("--lambda-feat-moment", type=float, default=0.0)
+    parser.add_argument("--lambda-dino-feat", type=float, default=0.0)
+    parser.add_argument("--dino-feat-loss", type=str, default="l1", choices=["l1", "l2"])
+    parser.add_argument("--dino-feat-input-size", type=int, default=224)
+    parser.add_argument("--dino-feat-use-patch-tokens", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dino-feat-normalize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lambda-router-budget", type=float, default=10.0)
     parser.add_argument("--lambda-router-binary", type=float, default=0.01)
     parser.add_argument("--lambda-router-ratio-target", type=float, default=0.0)

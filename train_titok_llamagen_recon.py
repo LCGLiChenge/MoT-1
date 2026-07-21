@@ -240,6 +240,91 @@ class DINOFeatureDiscriminator(nn.Module):
         return torch.cat(logits, dim=1)
 
 
+class FrozenDINOFeatureLoss(nn.Module):
+    def __init__(
+        self,
+        dino_repo,
+        dino_model="dinov2_vits14",
+        input_size=224,
+        use_patch_tokens=True,
+        loss_type="l1",
+        normalize_features=True,
+    ):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.use_patch_tokens = bool(use_patch_tokens)
+        self.loss_type = str(loss_type)
+        self.normalize_features = bool(normalize_features)
+        if self.loss_type not in {"l1", "l2"}:
+            raise ValueError(f"unsupported dino feature loss_type {loss_type}")
+        if not dino_repo:
+            raise ValueError("dino_repo must point to a local torch hub DINOv2 repo")
+        backbone = torch.hub.load(str(dino_repo), str(dino_model), source="local", pretrained=True)
+        backbone.eval().requires_grad_(False)
+        self.dino_proxy = (backbone,)
+        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None])
+        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None])
+
+    def _apply(self, fn, *args, **kwargs):
+        super()._apply(fn, *args, **kwargs)
+        self.dino_proxy[0]._apply(fn, *args, **kwargs)
+        return self
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.dino_proxy[0].eval()
+        return self
+
+    def extract_features(self, x_01):
+        x = x_01.float()
+        if x.shape[-2:] != (self.input_size, self.input_size):
+            x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
+        x = (x - self.imagenet_mean) / self.imagenet_std
+        features = self.dino_proxy[0].forward_features(x)
+        if not isinstance(features, dict) or "x_norm_clstoken" not in features:
+            raise RuntimeError("DINO backbone must return forward_features with x_norm_clstoken")
+        outputs = [features["x_norm_clstoken"]]
+        patch_tokens = features.get("x_norm_patchtokens")
+        if self.use_patch_tokens and patch_tokens is not None:
+            outputs.append(patch_tokens)
+        if self.normalize_features:
+            outputs = [F.normalize(item.float(), dim=-1) for item in outputs]
+        else:
+            outputs = [item.float() for item in outputs]
+        return outputs
+
+    def forward(self, pred, target, pred_range="minus1_1", target_range="minus1_1"):
+        pred_01 = image_to_zero_one(pred, pred_range)
+        target_01 = image_to_zero_one(target, target_range)
+        pred_features = self.extract_features(pred_01)
+        with torch.no_grad():
+            target_features = self.extract_features(target_01)
+        losses = []
+        for pred_feature, target_feature in zip(pred_features, target_features):
+            if self.loss_type == "l1":
+                losses.append(F.l1_loss(pred_feature, target_feature))
+            else:
+                losses.append(F.mse_loss(pred_feature, target_feature))
+        if not losses:
+            return pred.new_zeros(())
+        return sum(losses) / len(losses)
+
+
+def build_dino_feature_loss(args, device):
+    if getattr(args, "lambda_dino_feat", 0.0) <= 0.0:
+        return None
+    loss = FrozenDINOFeatureLoss(
+        dino_repo=getattr(args, "dino_repo", "../.cache/torch/hub/facebookresearch_dinov2_main"),
+        dino_model=getattr(args, "dino_model", "dinov2_vits14"),
+        input_size=getattr(args, "dino_feat_input_size", getattr(args, "dino_input_size", 224)),
+        use_patch_tokens=getattr(args, "dino_feat_use_patch_tokens", True),
+        loss_type=getattr(args, "dino_feat_loss", "l1"),
+        normalize_features=getattr(args, "dino_feat_normalize", True),
+    ).to(device)
+    loss.eval().requires_grad_(False)
+    return loss
+
+
 class PatchAndDINOFeatureDiscriminator(nn.Module):
     primary_load_name = "primary_patch"
 
