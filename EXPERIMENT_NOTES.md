@@ -106,3 +106,23 @@ Eval result on 50k validation images, EMA:
 - step 135000: FID 2.57339, PSNR 20.3862, LPIPS 0.19936, L1 0.13807, SSIM 0.50919, tokens 133.51.
 - Interpretation: step 133000 matches the 132000 EMA baseline because the first 1000 resumed steps freeze G and skip EMA updates; only D is recalibrated.
 - Conclusion: D-only warmup plus discriminator feature matching is stable, but does not materially improve FID beyond the clean 132000 baseline. The best measured checkpoint is 134000 by a negligible FID margin, so this is not enough to claim a real FID gain.
+
+## 2026-07-22 - Direct GAN pressure probe from clean 132000
+
+Context:
+- The D-only warmup plus discriminator feature matching branch was stable but did not materially improve FID.
+- New probe removes both mechanisms and directly increases GAN pressure, to test whether FID is limited by weak generator-side adversarial signal.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan016_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 136000, save every 1000 steps.
+- `lambda_gan=0.16`, `lambda_disc_feature_matching=0.0`, `g_freeze_steps=0`.
+- Keep inherited Patch+DINO D, `dino_loss_weight=0.50`, `lr_d=2e-5`, and full low-lr 2D tokenizer+decoder training unchanged.
+- Local 4-GPU setting uses `batch_size=4`, `accum_steps=6`, global batch 96.
+
+Smoke result:
+- 4-GPU 1-step smoke completed from step 132000 to 132001 with local path overrides.
+- Run header confirmed `global_batch=96`, `gan:0.16`, `disc_fm:0.0`, `g_freeze:0`, and `phase=joint`.
+- The smoke step completed G/D update and saved `/tmp/mot_smoke_gan016_bs4/latest.pt`; temporary smoke outputs `/tmp/mot_smoke_gan016` and `/tmp/mot_smoke_gan016_bs4` were removed.
+
