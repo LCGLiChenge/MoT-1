@@ -67,3 +67,8 @@ Smoke result:
 - 4-GPU 1-step smoke completed with local path overrides for data, adapter init, and DINO repo.
 - Run header confirmed `trainable_params=2881541`, `train_post_quant_conv=False`, `train_llamagen_quantizer=False`, and `llamagen_decoder_train_last_n=2`.
 - The smoke step completed G/D update and saved `/tmp/mot_smoke_tail2/latest.pt`; the temporary output directory was removed after the test.
+
+Eval result on 50k validation images, EMA:
+- step 133000: FID 2.5807, PSNR 20.3887, LPIPS 0.19953, L1 0.13804, SSIM 0.50912, tokens 133.51.
+- step 134000: FID 2.5851, PSNR 20.3896, LPIPS 0.19954, L1 0.13803, SSIM 0.50918, tokens 133.51.
+- Conclusion: tail-only decoder unfreeze slightly improves PSNR/L1/SSIM but worsens FID versus the clean 132000 baseline, so it is not a good FID-compression direction.
