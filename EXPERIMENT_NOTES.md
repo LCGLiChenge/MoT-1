@@ -72,3 +72,29 @@ Eval result on 50k validation images, EMA:
 - step 133000: FID 2.5807, PSNR 20.3887, LPIPS 0.19953, L1 0.13804, SSIM 0.50912, tokens 133.51.
 - step 134000: FID 2.5851, PSNR 20.3896, LPIPS 0.19954, L1 0.13803, SSIM 0.50918, tokens 133.51.
 - Conclusion: tail-only decoder unfreeze slightly improves PSNR/L1/SSIM but worsens FID versus the clean 132000 baseline, so it is not a good FID-compression direction.
+
+## 2026-07-22 - D-only warmup + discriminator feature matching probe
+
+Context:
+- Goal: make GAN updates more FID-friendly after DINO feature loss and tail-only decoder unfreeze both worsened FID.
+- Hypothesis: first recalibrate the inherited Patch+DINO discriminator on the current mix distribution, then use discriminator feature matching to stabilize G updates.
+- This does not use validation/test statistics as a training target.
+
+Implementation:
+- Added `--g-freeze-steps`: during the first N resumed steps, the generator optimizer step and EMA update are skipped, while D still trains. G forward/backward is still executed to keep DDP reductions consistent.
+- Added `--lambda-disc-feature-matching`: G receives an L1 feature matching loss from the current discriminator intermediate features.
+- Feature matching supports Patch, MultiScale Patch, and Patch+DINO discriminators; DDP-wrapped discriminators are unwrapped before feature extraction.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_fm010_gfreeze1k_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 135000, save every 1000 steps.
+- First 1000 steps: G frozen / D only (`g_freeze_steps=1000`).
+- Joint phase: `lambda_disc_feature_matching=0.1`, `lambda_gan=0.12`, inherited Patch+DINO D, full low-lr 2D tokenizer+decoder trainable; 1D adapter and Router effectively frozen (`lr_router=0`).
+
+Smoke result:
+- `python3 -m py_compile train_titok_llamagen_recon.py train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py` passed.
+- Config parser resolved `lambda_disc_feature_matching=0.1`, `g_freeze_steps=1000`, `max_steps=135000`.
+- 4-GPU g-freeze 1-step smoke completed; progress bar showed `phase=g_freeze`, `fm=0.000`, and D update ran.
+- 4-GPU joint 1-step smoke with `--g-freeze-steps 0` completed; progress bar showed `phase=joint` and nonzero `fm=0.024`.
+- Temporary smoke outputs `/tmp/mot_smoke_fm_gfreeze` and `/tmp/mot_smoke_fm_joint` were removed.

@@ -418,6 +418,83 @@ def iter_weighted_logits(logits):
         yield logits, 1.0
 
 
+def _patch_discriminator_features(discriminator, x):
+    h = discriminator.block_in(x)
+    features = [h]
+    for block in discriminator.blocks:
+        h = block(h)
+        features.append(h)
+    h = discriminator.pool(h)
+    features.append(h)
+    return features
+
+
+def _dino_head_hidden(head, tokens):
+    h = head[0](tokens)
+    h = head[1](h)
+    h = head[2](h)
+    return h
+
+
+def _dino_discriminator_features(discriminator, x_01):
+    x = x_01.float()
+    if x.shape[-2:] != (discriminator.input_size, discriminator.input_size):
+        x = F.interpolate(
+            x,
+            size=(discriminator.input_size, discriminator.input_size),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+    x = (x - discriminator.imagenet_mean) / discriminator.imagenet_std
+    features = discriminator.dino_proxy[0].forward_features(x)
+    if not isinstance(features, dict) or "x_norm_clstoken" not in features:
+        raise RuntimeError("DINO backbone must return forward_features with x_norm_clstoken")
+    outputs = [_dino_head_hidden(discriminator.cls_head, features["x_norm_clstoken"])]
+    patch_tokens = features.get("x_norm_patchtokens")
+    if discriminator.use_patch_tokens and patch_tokens is not None:
+        outputs.append(_dino_head_hidden(discriminator.patch_head, patch_tokens))
+    return outputs
+
+
+def _weighted_discriminator_features(discriminator, x):
+    discriminator = getattr(discriminator, "module", discriminator)
+    if isinstance(discriminator, MultiScalePatchDiscriminator):
+        outputs = []
+        for disc, scale, weight in zip(discriminator.discriminators, discriminator.scales, discriminator.loss_weights):
+            if abs(scale - 1.0) < 1e-8:
+                x_scale = x
+            else:
+                size = (max(1, int(round(x.shape[-2] * scale))), max(1, int(round(x.shape[-1] * scale))))
+                x_scale = F.interpolate(x, size=size, mode="bilinear", align_corners=False, antialias=True)
+            outputs.extend((feature, float(weight)) for feature in _patch_discriminator_features(disc, x_scale))
+        return outputs
+    if isinstance(discriminator, PatchAndDINOFeatureDiscriminator):
+        outputs = [(feature, discriminator.patch_loss_weight) for feature in _patch_discriminator_features(discriminator.patch_discriminator, x)]
+        outputs.extend((feature, discriminator.dino_loss_weight) for feature in _dino_discriminator_features(discriminator.dino_discriminator, x))
+        return outputs
+    if hasattr(discriminator, "block_in") and hasattr(discriminator, "blocks") and hasattr(discriminator, "pool"):
+        return [(feature, 1.0) for feature in _patch_discriminator_features(discriminator, x)]
+    return []
+
+
+def discriminator_feature_matching_loss(discriminator, fake, real):
+    fake_features = _weighted_discriminator_features(discriminator, fake)
+    if not fake_features:
+        return fake.new_zeros(())
+    with torch.no_grad():
+        real_features = _weighted_discriminator_features(discriminator, real)
+    losses = []
+    weights = []
+    for (fake_feature, fake_weight), (real_feature, real_weight) in zip(fake_features, real_features):
+        weight = 0.5 * (float(fake_weight) + float(real_weight))
+        losses.append(F.l1_loss(fake_feature.float(), real_feature.detach().float()) * weight)
+        weights.append(weight)
+    if not losses:
+        return fake.new_zeros(())
+    return sum(losses) / max(sum(weights), 1e-8)
+
+
 def split_discriminator_logits(logits, chunks=2, dim=0):
     if isinstance(logits, (list, tuple)):
         split_parts = [[] for _ in range(chunks)]
