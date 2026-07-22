@@ -164,3 +164,10 @@ Smoke result:
 - Progress bar showed nonzero `gan=0.021` and `lf=0.029`, confirming both new loss paths were active.
 - Temporary smoke output `/tmp/mot_smoke_hfgan_lfanchor` was removed.
 
+Failure update:
+- Training saved `step_00133000.pt`, `step_00134000.pt`, `step_00135000.pt`, and `latest.pt`; these checkpoint files were deleted after preserving log/eval json.
+- Eval on 50k validation images, EMA, step 133000: FID 2.72009, PSNR 20.2852, LPIPS 0.19878, L1 0.13950, SSIM 0.50607, tokens 133.54.
+- Training log also deteriorated: mix PSNR moved from about 19.72 at 132050 to about 19.53 at 133000 and about 19.41 at 135000; low-frequency anchor rose from about 0.0293 to about 0.0313.
+- Diagnosis: `highfreq_composite` changed the discriminator fake distribution to `low(real) + high(fake)`. This hid fake low-frequency errors from D, created a new D task unlike the inherited Patch+DINO full-image discriminator, and made the adversarial signal poorly aligned with full-image FID. The low-frequency anchor was too weak and redundant with existing L1 to counteract this.
+- Conclusion: do not continue this branch. A safer variant should keep D inputs as normal real/fake full images and only detach fake low-frequency content on the generator path if high-frequency-only GAN gradients are desired.
+
