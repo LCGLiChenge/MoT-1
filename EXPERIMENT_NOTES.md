@@ -171,3 +171,32 @@ Failure update:
 - Diagnosis: `highfreq_composite` changed the discriminator fake distribution to `low(real) + high(fake)`. This hid fake low-frequency errors from D, created a new D task unlike the inherited Patch+DINO full-image discriminator, and made the adversarial signal poorly aligned with full-image FID. The low-frequency anchor was too weak and redundant with existing L1 to counteract this.
 - Conclusion: do not continue this branch. A safer variant should keep D inputs as normal real/fake full images and only detach fake low-frequency content on the generator path if high-frequency-only GAN gradients are desired.
 
+
+
+## 2026-07-22 - High-frequency generator-gradient-only GAN probe
+
+Context:
+- The previous `highfreq_composite + lowfreq_anchor` branch failed because it changed the discriminator fake input distribution to `low(real) + high(fake)`, which made D optimize a task misaligned with full-image FID.
+- This probe keeps D input as the normal full fake/real images, and only removes the low-frequency component from the generator-side GAN gradient.
+
+Implementation:
+- Added `gan_input_filter=highfreq_grad_only`.
+- For generator GAN loss only, fake input is computed as `fake + low(fake).detach() - low(fake)`, so the forward value remains the full fake image while the GAN gradient becomes high-pass filtered.
+- For discriminator updates, fake and real inputs remain full images exactly as in `gan_input_filter=none`.
+- Kept `highfreq_composite` available for reproducibility, but it should not be used for this probe.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan014_hfgrad_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 133000, save every 1000 steps.
+- `lambda_gan=0.14`, `gan_input_filter=highfreq_grad_only`, `gan_highpass_size=64`, `lambda_lowfreq_anchor=0.0`.
+- Keep inherited Patch+DINO D, `dino_loss_weight=0.50`, `lr_d=2e-5`, and full low-lr 2D tokenizer+decoder training unchanged.
+- Local 4-GPU setting uses `batch_size=4`, `accum_steps=6`, global batch 96.
+
+Smoke result:
+- `python3 -m py_compile train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py` passed.
+- Config parser resolved `lambda_gan=0.14`, `gan_input_filter=highfreq_grad_only`, `gan_highpass_size=64`, `lambda_lowfreq_anchor=0.0`, `max_steps=133000`, `batch_size=4`, `accum_steps=6`.
+- 4-GPU smoke on GPUs 0,3,4,5 completed one G/D update from step 132000 to 132001.
+- Run header confirmed `global_batch=96`, `gan:0.14@72000+ramp0/highfreq_grad_only@64`, `lowfreq_anchor:0.0@32`, and `phase=joint`.
+- Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.051`, `lf=0.000`, `d=0.652`.
+- Temporary smoke output `/tmp/mot_smoke_gan014_hfgrad` was removed.

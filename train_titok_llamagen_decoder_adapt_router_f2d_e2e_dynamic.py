@@ -64,7 +64,7 @@ def _lowpass_upsample_01(x, low_size):
     return F.interpolate(low, size=x.shape[-2:], mode="bilinear", align_corners=False, antialias=True)
 
 
-def prepare_gan_inputs(fake, real, image_range, args):
+def prepare_gan_inputs(fake, real, image_range, args, for_generator=False):
     fake_01 = discriminator_input(fake, image_range)
     real_01 = discriminator_input(real, image_range)
     if args.gan_input_filter == "none":
@@ -75,6 +75,11 @@ def prepare_gan_inputs(fake, real, image_range, args):
         fake_hf = fake_01 - low_fake
         fake_composite = (low_real.detach() + fake_hf).clamp(0.0, 1.0)
         return fake_composite, real_01
+    if args.gan_input_filter == "highfreq_grad_only":
+        if for_generator:
+            low_fake = _lowpass_upsample_01(fake_01, args.gan_highpass_size)
+            fake_01 = fake_01 + low_fake.detach() - low_fake
+        return fake_01, real_01
     raise ValueError(f"unsupported gan_input_filter {args.gan_input_filter}")
 
 
@@ -1197,7 +1202,13 @@ def main(args):
                 disc_fm_loss = x_mix.new_zeros(())
                 if discriminator is not None and gan_factor > 0.0 and not d_warmup_active:
                     set_requires_grad(discriminator, False)
-                    fake_for_g, real_for_g = prepare_gan_inputs(x_mix, x_lg, args.llamagen_input_range, args)
+                    fake_for_g, real_for_g = prepare_gan_inputs(
+                        x_mix,
+                        x_lg,
+                        args.llamagen_input_range,
+                        args,
+                        for_generator=True,
+                    )
                     logits_fake_for_g = discriminator(fake_for_g)
                     gan_g_loss = gan_g_loss_from_logits(logits_fake_for_g)
                     if args.lambda_disc_feature_matching > 0.0 and not g_freeze_active:
@@ -1236,7 +1247,13 @@ def main(args):
             logits_fake_mean = x_mix.new_zeros(())
             if train_discriminator:
                 set_requires_grad(discriminator, True)
-                fake_for_d, real_for_d = prepare_gan_inputs(x_mix.detach(), x_lg, args.llamagen_input_range, args)
+                fake_for_d, real_for_d = prepare_gan_inputs(
+                    x_mix.detach(),
+                    x_lg,
+                    args.llamagen_input_range,
+                    args,
+                    for_generator=False,
+                )
                 real_for_d = real_for_d.detach()
                 fake_for_d = fake_for_d.detach()
                 logits_both = discriminator(torch.cat([real_for_d, fake_for_d], dim=0))
@@ -1620,7 +1637,7 @@ def build_parser():
     parser.add_argument("--lambda-gan", type=float, default=0.0)
     parser.add_argument("--gan-start-step", type=int, default=0)
     parser.add_argument("--gan-ramp-steps", type=int, default=0)
-    parser.add_argument("--gan-input-filter", type=str, default="none", choices=["none", "highfreq_composite"])
+    parser.add_argument("--gan-input-filter", type=str, default="none", choices=["none", "highfreq_composite", "highfreq_grad_only"])
     parser.add_argument("--gan-highpass-size", type=int, default=64)
     parser.add_argument("--discriminator-factor", type=float, default=1.0)
     parser.add_argument("--lr-d", type=float, default=1.0e-5)
