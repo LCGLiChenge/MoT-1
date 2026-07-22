@@ -63,6 +63,7 @@ def format_run_header(args, dataset_len, world_size, trainable_params):
         f"train_adapter={args.train_adapter} train_llamagen_encoder={args.train_llamagen_encoder} "
         f"train_llamagen_quant_conv={args.train_llamagen_quant_conv} train_llamagen_quantizer={args.train_llamagen_quantizer} "
         f"train_post_quant_conv={args.train_post_quant_conv} train_llamagen_decoder={args.train_llamagen_decoder} "
+        f"llamagen_decoder_train_last_n={args.llamagen_decoder_train_last_n} "
         f"lr_adapter={args.lr} lr_lg_encoder={args.lr_llamagen_encoder} lr_llamagen={args.lr_llamagen} "
         f"loss=image({args.image_loss}) base:{args.lambda_base},mix:{args.lambda_mix},native:{args.lambda_native},"
         f"mix_native:{args.lambda_mix_native}@{args.lambda_mix_native_perceptual}/{args.mix_native_teacher},"
@@ -134,6 +135,22 @@ def set_module_trainable(module: nn.Module | None, requires_grad: bool):
         param.requires_grad_(requires_grad)
 
 
+def set_llamagen_decoder_trainable(decoder: nn.Module | None, train_decoder: bool, train_last_n: int):
+    if decoder is None:
+        return
+    set_module_trainable(decoder, False)
+    if not train_decoder or train_last_n == 0:
+        return
+    if train_last_n < 0 or not hasattr(decoder, "conv_blocks"):
+        set_module_trainable(decoder, True)
+        return
+
+    conv_blocks = getattr(decoder, "conv_blocks")
+    for block in list(conv_blocks)[-train_last_n:]:
+        set_module_trainable(block, True)
+    set_module_trainable(getattr(decoder, "conv_out", None), True)
+
+
 def configure_trainable_parts(model: TiTokLlamaGenStage2, args):
     model.titok.eval().requires_grad_(False)
     model.latent_decoder.requires_grad_(args.train_adapter)
@@ -142,7 +159,11 @@ def configure_trainable_parts(model: TiTokLlamaGenStage2, args):
     set_module_trainable(getattr(model.llamagen_vq, "quantize", None), args.train_llamagen_quantizer)
     set_module_trainable(getattr(model.llamagen_vq, "quant_conv", None), args.train_llamagen_quant_conv)
     set_module_trainable(getattr(model.llamagen_vq, "post_quant_conv", None), args.train_post_quant_conv)
-    set_module_trainable(getattr(model.llamagen_vq, "decoder", None), args.train_llamagen_decoder)
+    set_llamagen_decoder_trainable(
+        getattr(model.llamagen_vq, "decoder", None),
+        args.train_llamagen_decoder,
+        args.llamagen_decoder_train_last_n,
+    )
     set_module_trainable(getattr(model, "router", None), args.train_router)
     return model
 
@@ -1512,6 +1533,7 @@ def build_parser():
     parser.add_argument("--train-llamagen-quantizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--train-post-quant-conv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--train-llamagen-decoder", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--llamagen-decoder-train-last-n", type=int, default=-1)
     parser.add_argument("--train-router", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--image-loss", type=str, default="l1", choices=["l1", "l2"])
     parser.add_argument("--perceptual-loss", type=str, default="lpips", choices=["lpips", "convnext_s", "none"])
