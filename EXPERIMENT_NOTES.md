@@ -200,3 +200,8 @@ Smoke result:
 - Run header confirmed `global_batch=96`, `gan:0.14@72000+ramp0/highfreq_grad_only@64`, `lowfreq_anchor:0.0@32`, and `phase=joint`.
 - Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.051`, `lf=0.000`, `d=0.652`.
 - Temporary smoke output `/tmp/mot_smoke_gan014_hfgrad` was removed.
+
+Eval result on 50k validation images, EMA:
+- step 133000: FID 2.61921, PSNR 20.4116, LPIPS 0.19979, L1 0.13772, SSIM 0.50985, tokens 133.51.
+- Compared with the direct full-image `lambda_gan=0.16` probe at step 133000 (FID 2.55916, PSNR 20.3476), `highfreq_grad_only + lambda_gan=0.14` preserves reconstruction better but gives worse FID.
+- Compared with the clean 132000 baseline region (FID about 2.57), this does not show a useful FID improvement. Do not continue this branch unless the priority shifts to preserving PSNR over FID.
