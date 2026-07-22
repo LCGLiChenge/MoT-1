@@ -232,3 +232,34 @@ Eval result on 50k validation images, EMA:
 - step 133000: FID 2.57684, PSNR 20.3993, LPIPS 0.19960, L1 0.13789, SSIM 0.50947, tokens 133.51.
 - Compared with direct full-image `lambda_gan=0.16, lambda_mix=2.0` at step 133000 (FID 2.55916, PSNR 20.3476), `lambda_mix=3.0` preserves PSNR better but loses the FID gain.
 - Conclusion: increasing reconstruction weight alone trades away the useful adversarial improvement; this branch is not a better FID direction.
+
+
+## 2026-07-22 - Multi-scale Patch+DINO discriminator probe
+
+Context:
+- Goal: try a more FID-friendly discriminator while keeping 1D frozen and avoiding validation/test leakage.
+- Previous best FID-oriented branch was direct full-image `lambda_gan=0.16`, but it only improved FID slightly and steadily degraded PSNR/L1/SSIM.
+- This probe keeps full-image real/fake D inputs and changes only the discriminator structure.
+
+Implementation:
+- Added `discriminator_type=multiscale_patch_dino`.
+- The patch branch is a `MultiScalePatchDiscriminator`; the DINO branch is the existing frozen DINOv2 feature discriminator.
+- Added compatible loading from old `patch_dino` discriminator checkpoints: old single-scale patch weights are copied into each multi-scale patch discriminator, and the old DINO branch is loaded unchanged. This avoids resetting D when resuming from the clean 132000 checkpoint.
+- Updated weighted-logit iteration and discriminator feature matching to flatten nested weighted outputs from `Patch+DINO(MultiScalePatch)`.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_multiscale_patchdinoD_gan014_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 136000, save every 1000 steps.
+- `lambda_gan=0.14`, `gan_input_filter=none`, `discriminator_type=multiscale_patch_dino`, `disc_scales=[1.0, 0.5]`, `disc_loss_weights=[1.0, 0.5]`, `dino_loss_weight=0.50`.
+- Keep inherited D weights (`reset_discriminator=false`), EMA enabled, Router effectively frozen (`lr_router=0`), and 1D adapter frozen (`train_adapter=false`).
+- Local 4-GPU setting uses `batch_size=4`, `accum_steps=6`, global batch 96.
+
+Smoke result:
+- `python3 -m py_compile train_titok_llamagen_recon.py train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py` passed.
+- Parser accepted `discriminator_type=multiscale_patch_dino`.
+- First smoke attempts exposed only launch/config issues: `--wandb false` should be `--no-wandb`, and this machine needs local overrides for `data_path`, `adapter_init`, and `dino_repo`.
+- 4-GPU smoke on GPUs 4,5,6,7 completed one full G/D update from step 132000 to 132001 with `batch_size=4`, `accum_steps=6`.
+- Run header confirmed `disc:multiscale_patch_dino/scales=[1.0, 0.5]/weights=[1.0, 0.5]`, `gan:0.14@72000+ramp0/none@64`, and `loaded discriminator from resume (full)`.
+- Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.038`, `d=0.731`, `phase=joint`.
+- Temporary smoke output `/tmp/mot_smoke_multiscale_patchdino` was removed.

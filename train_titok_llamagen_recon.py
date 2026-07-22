@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.modules.module import _IncompatibleKeys
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw
@@ -340,13 +341,16 @@ class PatchAndDINOFeatureDiscriminator(nn.Module):
         dino_input_size=224,
         dino_head_hidden=256,
         dino_use_patch_tokens=True,
+        patch_discriminator=None,
     ):
         super().__init__()
         if patch_loss_weight <= 0.0 or dino_loss_weight <= 0.0:
             raise ValueError("patch_loss_weight and dino_loss_weight must be positive")
         self.patch_loss_weight = float(patch_loss_weight)
         self.dino_loss_weight = float(dino_loss_weight)
-        self.patch_discriminator = discriminator_cls(hidden_channels=hidden_channels, num_stages=num_stages)
+        if patch_discriminator is None:
+            patch_discriminator = discriminator_cls(hidden_channels=hidden_channels, num_stages=num_stages)
+        self.patch_discriminator = patch_discriminator
         self.dino_discriminator = DINOFeatureDiscriminator(
             dino_repo=dino_repo,
             dino_model=dino_model,
@@ -362,7 +366,31 @@ class PatchAndDINOFeatureDiscriminator(nn.Module):
         ]
 
     def load_primary_state_dict(self, state_dict, strict=True):
+        if hasattr(self.patch_discriminator, "load_primary_state_dict"):
+            return self.patch_discriminator.load_primary_state_dict(state_dict, strict=strict)
         return self.patch_discriminator.load_state_dict(state_dict, strict=strict)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        patch_prefix = "patch_discriminator."
+        dino_prefix = "dino_discriminator."
+        has_single_patch = any(
+            key.startswith(patch_prefix) and not key.startswith(patch_prefix + "discriminators.")
+            for key in state_dict
+        )
+        if isinstance(self.patch_discriminator, MultiScalePatchDiscriminator) and has_single_patch:
+            patch_state = {key[len(patch_prefix):]: value for key, value in state_dict.items() if key.startswith(patch_prefix)}
+            dino_state = {key[len(dino_prefix):]: value for key, value in state_dict.items() if key.startswith(dino_prefix)}
+            missing = []
+            unexpected = []
+            for idx, disc in enumerate(self.patch_discriminator.discriminators):
+                patch_missing, patch_unexpected = disc.load_state_dict(patch_state, strict=strict, assign=assign)
+                missing.extend(f"{patch_prefix}discriminators.{idx}.{key}" for key in patch_missing)
+                unexpected.extend(f"{patch_prefix}{key}" for key in patch_unexpected)
+            dino_missing, dino_unexpected = self.dino_discriminator.load_state_dict(dino_state, strict=strict, assign=assign)
+            missing.extend(f"{dino_prefix}{key}" for key in dino_missing)
+            unexpected.extend(f"{dino_prefix}{key}" for key in dino_unexpected)
+            return _IncompatibleKeys(missing, unexpected)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
 
 def build_discriminator(args, device):
@@ -400,22 +428,45 @@ def build_discriminator(args, device):
             dino_head_hidden=getattr(args, "dino_head_hidden", 256),
             dino_use_patch_tokens=getattr(args, "dino_use_patch_tokens", True),
         ).to(device)
+    elif discriminator_type == "multiscale_patch_dino":
+        scales = parse_float_sequence(getattr(args, "disc_scales", [1.0, 0.5]), [1.0, 0.5])
+        weights = parse_float_sequence(getattr(args, "disc_loss_weights", [1.0, 0.5]), [1.0, 0.5])
+        patch_discriminator = MultiScalePatchDiscriminator(
+            NLayerDiscriminator,
+            scales=scales,
+            loss_weights=weights,
+            hidden_channels=args.disc_hidden_channels,
+            num_stages=args.disc_num_stages,
+        )
+        discriminator = PatchAndDINOFeatureDiscriminator(
+            NLayerDiscriminator,
+            hidden_channels=args.disc_hidden_channels,
+            num_stages=args.disc_num_stages,
+            patch_loss_weight=1.0,
+            dino_loss_weight=getattr(args, "dino_loss_weight", 0.25),
+            dino_repo=getattr(args, "dino_repo", "../.cache/torch/hub/facebookresearch_dinov2_main"),
+            dino_model=getattr(args, "dino_model", "dinov2_vits14"),
+            dino_input_size=getattr(args, "dino_input_size", 224),
+            dino_head_hidden=getattr(args, "dino_head_hidden", 256),
+            dino_use_patch_tokens=getattr(args, "dino_use_patch_tokens", True),
+            patch_discriminator=patch_discriminator,
+        ).to(device)
     else:
         raise ValueError(f"unsupported discriminator_type {discriminator_type}")
     return discriminator
 
 
-def iter_weighted_logits(logits):
+def iter_weighted_logits(logits, base_weight=1.0):
     if isinstance(logits, (list, tuple)):
         if len(logits) == 0:
             raise ValueError("empty discriminator logits")
         for item in logits:
-            if isinstance(item, (list, tuple)) and len(item) == 2:
-                yield item[0], float(item[1])
+            if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], (int, float)):
+                yield from iter_weighted_logits(item[0], base_weight * float(item[1]))
             else:
-                yield item, 1.0
+                yield from iter_weighted_logits(item, base_weight)
     else:
-        yield logits, 1.0
+        yield logits, base_weight
 
 
 def _patch_discriminator_features(discriminator, x):
@@ -470,7 +521,9 @@ def _weighted_discriminator_features(discriminator, x):
             outputs.extend((feature, float(weight)) for feature in _patch_discriminator_features(disc, x_scale))
         return outputs
     if isinstance(discriminator, PatchAndDINOFeatureDiscriminator):
-        outputs = [(feature, discriminator.patch_loss_weight) for feature in _patch_discriminator_features(discriminator.patch_discriminator, x)]
+        outputs = []
+        for feature, weight in _weighted_discriminator_features(discriminator.patch_discriminator, x):
+            outputs.append((feature, discriminator.patch_loss_weight * float(weight)))
         outputs.extend((feature, discriminator.dino_loss_weight) for feature in _dino_discriminator_features(discriminator.dino_discriminator, x))
         return outputs
     if hasattr(discriminator, "block_in") and hasattr(discriminator, "blocks") and hasattr(discriminator, "pool"):
@@ -1325,7 +1378,7 @@ def build_parser():
     parser.add_argument("--d-every", type=int, default=1)
     parser.add_argument("--lecam-regularization-weight", type=float, default=0.001)
     parser.add_argument("--lecam-ema-decay", type=float, default=0.999)
-    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "patch_dino"])
+    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "patch_dino", "multiscale_patch_dino"])
     parser.add_argument("--disc-scales", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-loss-weights", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-hidden-channels", type=int, default=128)
