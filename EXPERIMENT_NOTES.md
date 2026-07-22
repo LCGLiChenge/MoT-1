@@ -98,3 +98,11 @@ Smoke result:
 - 4-GPU g-freeze 1-step smoke completed; progress bar showed `phase=g_freeze`, `fm=0.000`, and D update ran.
 - 4-GPU joint 1-step smoke with `--g-freeze-steps 0` completed; progress bar showed `phase=joint` and nonzero `fm=0.024`.
 - Temporary smoke outputs `/tmp/mot_smoke_fm_gfreeze` and `/tmp/mot_smoke_fm_joint` were removed.
+
+
+Eval result on 50k validation images, EMA:
+- step 133000: FID 2.57319, PSNR 20.3849, LPIPS 0.19949, L1 0.13808, SSIM 0.50897, tokens 133.51.
+- step 134000: FID 2.57316, PSNR 20.3892, LPIPS 0.19952, L1 0.13804, SSIM 0.50914, tokens 133.51.
+- step 135000: FID 2.57339, PSNR 20.3862, LPIPS 0.19936, L1 0.13807, SSIM 0.50919, tokens 133.51.
+- Interpretation: step 133000 matches the 132000 EMA baseline because the first 1000 resumed steps freeze G and skip EMA updates; only D is recalibrated.
+- Conclusion: D-only warmup plus discriminator feature matching is stable, but does not materially improve FID beyond the clean 132000 baseline. The best measured checkpoint is 134000 by a negligible FID margin, so this is not enough to claim a real FID gain.
