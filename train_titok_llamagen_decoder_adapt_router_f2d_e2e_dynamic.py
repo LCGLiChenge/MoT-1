@@ -56,6 +56,37 @@ from train_titok_llamagen_recon import (
 )
 
 
+def _lowpass_upsample_01(x, low_size):
+    low_size = int(low_size)
+    if low_size <= 0 or (x.shape[-2] == low_size and x.shape[-1] == low_size):
+        return x.float()
+    low = F.interpolate(x.float(), size=(low_size, low_size), mode="bilinear", align_corners=False, antialias=True)
+    return F.interpolate(low, size=x.shape[-2:], mode="bilinear", align_corners=False, antialias=True)
+
+
+def prepare_gan_inputs(fake, real, image_range, args):
+    fake_01 = discriminator_input(fake, image_range)
+    real_01 = discriminator_input(real, image_range)
+    if args.gan_input_filter == "none":
+        return fake_01, real_01
+    if args.gan_input_filter == "highfreq_composite":
+        low_real = _lowpass_upsample_01(real_01, args.gan_highpass_size)
+        low_fake = _lowpass_upsample_01(fake_01, args.gan_highpass_size)
+        fake_hf = fake_01 - low_fake
+        fake_composite = (low_real.detach() + fake_hf).clamp(0.0, 1.0)
+        return fake_composite, real_01
+    raise ValueError(f"unsupported gan_input_filter {args.gan_input_filter}")
+
+
+def compute_lowfreq_anchor_loss(pred, target, image_range, low_size):
+    pred_01 = discriminator_input(pred, image_range)
+    target_01 = discriminator_input(target, image_range)
+    low_size = int(low_size)
+    if low_size > 0:
+        pred_01 = F.interpolate(pred_01.float(), size=(low_size, low_size), mode="bilinear", align_corners=False, antialias=True)
+        target_01 = F.interpolate(target_01.float(), size=(low_size, low_size), mode="bilinear", align_corners=False, antialias=True)
+    return F.l1_loss(pred_01.float(), target_01.float())
+
 def format_run_header(args, dataset_len, world_size, trainable_params):
     effective_batch = args.batch_size * world_size * args.accum_steps
     summary = (
@@ -70,8 +101,8 @@ def format_run_header(args, dataset_len, world_size, trainable_params):
         f"mix_native:{args.lambda_mix_native}@{args.lambda_mix_native_perceptual}/{args.mix_native_teacher},"
         f"perceptual({args.perceptual_loss}):{get_perceptual_weight(args)},feat:{args.lambda_feat},"
         f"feat_moment:{args.lambda_feat_moment},dino_feat:{args.lambda_dino_feat}/{args.dino_feat_loss},"
-        f"disc_fm:{args.lambda_disc_feature_matching},"
-        f"gan:{args.lambda_gan}@{args.gan_start_step}+ramp{args.gan_ramp_steps},"
+        f"disc_fm:{args.lambda_disc_feature_matching},lowfreq_anchor:{args.lambda_lowfreq_anchor}@{args.lowfreq_anchor_size},"
+        f"gan:{args.lambda_gan}@{args.gan_start_step}+ramp{args.gan_ramp_steps}/{args.gan_input_filter}@{args.gan_highpass_size},"
         f"disc:{args.discriminator_type}/scales={args.disc_scales}/weights={args.disc_loss_weights},"
         f"dino:{args.dino_model}@{args.dino_loss_weight},"
         f"d_every:{args.d_every},d_warmup:{args.d_warmup_steps},g_freeze:{args.g_freeze_steps},lecam:{args.lecam_regularization_weight} "
@@ -897,6 +928,7 @@ def main(args):
         "dino_feat": 0.0,
         "gan_g": 0.0,
         "disc_fm": 0.0,
+        "lowfreq_anchor": 0.0,
         "d_loss": 0.0,
         "lecam": 0.0,
         "logits_real": 0.0,
@@ -1127,6 +1159,14 @@ def main(args):
                         pred_range=args.llamagen_input_range,
                         target_range=args.llamagen_input_range,
                     )
+                lowfreq_anchor_loss = x_mix.new_zeros(())
+                if float(args.lambda_lowfreq_anchor) > 0.0:
+                    lowfreq_anchor_loss = compute_lowfreq_anchor_loss(
+                        x_mix,
+                        x_lg,
+                        args.llamagen_input_range,
+                        args.lowfreq_anchor_size,
+                    )
                 router_aux_weight = float(args.router_gain_aux_weight)
                 if args.router_gain_aux_decay_steps > 0:
                     router_aux_weight *= max(0.0, 1.0 - float(step - start_step) / float(args.router_gain_aux_decay_steps))
@@ -1157,11 +1197,10 @@ def main(args):
                 disc_fm_loss = x_mix.new_zeros(())
                 if discriminator is not None and gan_factor > 0.0 and not d_warmup_active:
                     set_requires_grad(discriminator, False)
-                    fake_for_g = discriminator_input(x_mix, args.llamagen_input_range)
+                    fake_for_g, real_for_g = prepare_gan_inputs(x_mix, x_lg, args.llamagen_input_range, args)
                     logits_fake_for_g = discriminator(fake_for_g)
                     gan_g_loss = gan_g_loss_from_logits(logits_fake_for_g)
                     if args.lambda_disc_feature_matching > 0.0 and not g_freeze_active:
-                        real_for_g = discriminator_input(x_lg, args.llamagen_input_range)
                         disc_fm_loss = discriminator_feature_matching_loss(discriminator, fake_for_g, real_for_g)
                 loss = (
                     base_loss
@@ -1171,6 +1210,7 @@ def main(args):
                     + args.lambda_feat * feat_loss
                     + args.lambda_feat_moment * feat_moment
                     + args.lambda_dino_feat * dino_feat_loss
+                    + args.lambda_lowfreq_anchor * lowfreq_anchor_loss
                     + args.lambda_disc_feature_matching * disc_fm_loss
                     + args.lambda_gan * gan_factor * gan_g_loss
                     + args.lambda_router_budget * router_budget_loss
@@ -1196,8 +1236,9 @@ def main(args):
             logits_fake_mean = x_mix.new_zeros(())
             if train_discriminator:
                 set_requires_grad(discriminator, True)
-                real_for_d = discriminator_input(x_lg, args.llamagen_input_range).detach()
-                fake_for_d = discriminator_input(x_mix.detach(), args.llamagen_input_range)
+                fake_for_d, real_for_d = prepare_gan_inputs(x_mix.detach(), x_lg, args.llamagen_input_range, args)
+                real_for_d = real_for_d.detach()
+                fake_for_d = fake_for_d.detach()
                 logits_both = discriminator(torch.cat([real_for_d, fake_for_d], dim=0))
                 logits_real, logits_fake = split_discriminator_logits(logits_both, chunks=2, dim=0)
                 logits_real_mean = weighted_logits_mean(logits_real)
@@ -1232,6 +1273,7 @@ def main(args):
             metric_sums["dino_feat"] += dino_feat_loss.detach().float().item()
             metric_sums["gan_g"] += (args.lambda_gan * gan_factor * gan_g_loss).detach().float().item()
             metric_sums["disc_fm"] += (args.lambda_disc_feature_matching * disc_fm_loss).detach().float().item()
+            metric_sums["lowfreq_anchor"] += (args.lambda_lowfreq_anchor * lowfreq_anchor_loss).detach().float().item()
             metric_sums["d_loss"] += d_loss.detach().float().item()
             metric_sums["lecam"] += lecam_loss.detach().float().item()
             metric_sums["router_budget"] += router_budget_loss.detach().float().item()
@@ -1291,6 +1333,7 @@ def main(args):
                 metric_sums["dino_feat"] / args.accum_steps,
                 metric_sums["gan_g"] / args.accum_steps,
                 metric_sums["disc_fm"] / args.accum_steps,
+                metric_sums["lowfreq_anchor"] / args.accum_steps,
                 metric_sums["d_loss"] / args.accum_steps,
                 metric_sums["lecam"] / args.accum_steps,
                 metric_sums["logits_real"] / args.accum_steps,
@@ -1326,7 +1369,7 @@ def main(args):
             "loss", "base", "base_lp", "base_mse01", "mix", "mix_lp", "mix_mse01",
             "mix_native", "mix_native_lp",
             "native", "native_lp", "native_mse01", "feat", "feat_moment", "dino_feat",
-            "gan_g", "disc_fm", "d_loss", "lecam", "logits_real", "logits_fake",
+            "gan_g", "disc_fm", "lowfreq_anchor", "d_loss", "lecam", "logits_real", "logits_fake",
             "mask", "mask_tokens", "mask_tokens_std", "mask_tokens_min", "mask_tokens_max",
             "score", "score_error", "score_gradient", "score_variance",
             "selector_threshold", "selector_ratio_ema", "router_budget", "router_binary",
@@ -1357,6 +1400,7 @@ def main(args):
                 "rr": f"{running['router_ratio'] / denom:.2f}",
                 "gan": f"{running['gan_g'] / denom:.3f}",
                 "fm": f"{running['disc_fm'] / denom:.3f}",
+                "lf": f"{running['lowfreq_anchor'] / denom:.3f}",
                 "d": f"{running['d_loss'] / denom:.3f}",
                 "phase": "g_freeze" if g_freeze_active else ("router" if router_only_active else "joint"),
             })
@@ -1393,7 +1437,7 @@ def main(args):
                 f"mix_native {running['mix_native']/denom:.5f} lp {running['mix_native_lp']/denom:.5f} | "
                 f"feat {running['feat']/denom:.5f} feat_moment {running['feat_moment']/denom:.5f} "
                 f"dino_feat {running['dino_feat']/denom:.5f} | "
-                f"gan_g {running['gan_g']/denom:.5f} disc_fm {running['disc_fm']/denom:.5f} | d {running['d_loss']/denom:.5f} | "
+                f"gan_g {running['gan_g']/denom:.5f} disc_fm {running['disc_fm']/denom:.5f} lowfreq_anchor {running['lowfreq_anchor']/denom:.5f} | d {running['d_loss']/denom:.5f} | "
                 f"router_budget {running['router_budget']/denom:.5f} router_binary {running['router_binary']/denom:.5f} "
                 f"router_aux {running['router_aux']/denom:.5f} "
                 f"ratio_tgt_std {running['router_ratio_target_std']/denom:.3f} "
@@ -1563,6 +1607,8 @@ def build_parser():
     parser.add_argument("--lambda-feat", type=float, default=0.0)
     parser.add_argument("--lambda-feat-moment", type=float, default=0.0)
     parser.add_argument("--lambda-disc-feature-matching", type=float, default=0.0)
+    parser.add_argument("--lambda-lowfreq-anchor", type=float, default=0.0)
+    parser.add_argument("--lowfreq-anchor-size", type=int, default=32)
     parser.add_argument("--lambda-dino-feat", type=float, default=0.0)
     parser.add_argument("--dino-feat-loss", type=str, default="l1", choices=["l1", "l2"])
     parser.add_argument("--dino-feat-input-size", type=int, default=224)
@@ -1574,6 +1620,8 @@ def build_parser():
     parser.add_argument("--lambda-gan", type=float, default=0.0)
     parser.add_argument("--gan-start-step", type=int, default=0)
     parser.add_argument("--gan-ramp-steps", type=int, default=0)
+    parser.add_argument("--gan-input-filter", type=str, default="none", choices=["none", "highfreq_composite"])
+    parser.add_argument("--gan-highpass-size", type=int, default=64)
     parser.add_argument("--discriminator-factor", type=float, default=1.0)
     parser.add_argument("--lr-d", type=float, default=1.0e-5)
     parser.add_argument("--d-every", type=int, default=1)

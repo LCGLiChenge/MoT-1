@@ -134,3 +134,33 @@ Eval result on 50k validation images, EMA:
 - Interpretation: stronger GAN pressure can reduce FID versus the clean 132000 baseline (FID 2.57319), with best measured FID at 135000, but reconstruction metrics degrade steadily.
 - Conclusion: this is a real but small FID improvement, not enough for the 2.2 target. Treat 135000 as the best gan0.16 checkpoint so far; do not continue this branch blindly unless accepting further PSNR/L1 drift.
 
+## 2026-07-22 - High-frequency GAN plus low-frequency anchor probe
+
+Context:
+- The direct `lambda_gan=0.16` probe improved FID slightly but steadily degraded PSNR/L1/SSIM, suggesting adversarial gradients were changing low-frequency structure or color, not only texture.
+- Deleted the generated gan0.16 probe weights (`latest.pt`, `step_00133000.pt`, `step_00134000.pt`, `step_00135000.pt`, `step_00136000.pt`) after preserving log and eval json files.
+
+Implementation:
+- Added `--gan-input-filter` with default `none` and new mode `highfreq_composite`.
+- In `highfreq_composite`, discriminator fake input is `low(real) + high(fake)`, clipped to `[0, 1]`; this keeps D input image-like while forcing the adversarial gradient to mainly affect fake high-frequency content.
+- Added `--gan-highpass-size` to control the low/high split resolution.
+- Added `--lambda-lowfreq-anchor` and `--lowfreq-anchor-size`; the anchor is an L1 loss between downsampled `x_mix` and downsampled real image, intended to protect low-frequency color/structure and PSNR.
+- Defaults keep old behavior unchanged: `gan_input_filter=none`, `lambda_lowfreq_anchor=0`.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan016_hfgan_lfanchor_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 136000, save every 1000 steps.
+- `lambda_gan=0.16`, `gan_input_filter=highfreq_composite`, `gan_highpass_size=64`, `lambda_lowfreq_anchor=1.0`, `lowfreq_anchor_size=32`.
+- Keep inherited Patch+DINO D, `dino_loss_weight=0.50`, `lr_d=2e-5`, and full low-lr 2D tokenizer+decoder training unchanged.
+- Local 4-GPU setting uses `batch_size=4`, `accum_steps=6`, global batch 96.
+
+Smoke result:
+- `python3 -m py_compile train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py` passed.
+- Config parser resolved `lambda_gan=0.16`, `gan_input_filter=highfreq_composite`, `gan_highpass_size=64`, `lambda_lowfreq_anchor=1.0`, `lowfreq_anchor_size=32`, `batch_size=4`, `accum_steps=6`, `max_steps=136000`.
+- First 4-GPU smoke on GPUs 4,5,6,7 failed because GPU7 was occupied by another process using about 28.8GB; no code error.
+- Re-ran 4-GPU smoke on GPUs 0,4,5,6; it completed one G/D update from step 132000 to 132001.
+- Run header confirmed `global_batch=96`, `lowfreq_anchor:1.0@32`, `gan:0.16@72000+ramp0/highfreq_composite@64`, and `phase=joint`.
+- Progress bar showed nonzero `gan=0.021` and `lf=0.029`, confirming both new loss paths were active.
+- Temporary smoke output `/tmp/mot_smoke_hfgan_lfanchor` was removed.
+
