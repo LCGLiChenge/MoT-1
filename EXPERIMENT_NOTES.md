@@ -205,3 +205,25 @@ Eval result on 50k validation images, EMA:
 - step 133000: FID 2.61921, PSNR 20.4116, LPIPS 0.19979, L1 0.13772, SSIM 0.50985, tokens 133.51.
 - Compared with the direct full-image `lambda_gan=0.16` probe at step 133000 (FID 2.55916, PSNR 20.3476), `highfreq_grad_only + lambda_gan=0.14` preserves reconstruction better but gives worse FID.
 - Compared with the clean 132000 baseline region (FID about 2.57), this does not show a useful FID improvement. Do not continue this branch unless the priority shifts to preserving PSNR over FID.
+
+
+## 2026-07-22 - Full-image GAN 0.16 with stronger reconstruction weight probe
+
+Context:
+- `highfreq_grad_only + lambda_gan=0.14` preserved PSNR but worsened FID, so the next probe returns to full-image GAN input.
+- Direct full-image `lambda_gan=0.16` gave the best FID among recent probes, but PSNR/L1/SSIM drifted steadily. This probe keeps that FID-oriented adversarial signal and increases the mix reconstruction weight.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan016_mix3_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 133000, save every 1000 steps.
+- `lambda_gan=0.16`, `gan_input_filter=none`, `lambda_mix=3.0`, `lambda_disc_feature_matching=0.0`, `g_freeze_steps=0`.
+- Keep inherited Patch+DINO D, `dino_loss_weight=0.50`, `lr_d=2e-5`, and full low-lr 2D tokenizer+decoder training unchanged.
+- Local 4-GPU setting uses `batch_size=4`, `accum_steps=6`, global batch 96.
+
+Smoke result:
+- Config parser resolved `lambda_gan=0.16`, `gan_input_filter=none`, `lambda_mix=3.0`, `max_steps=133000`, `batch_size=4`, `accum_steps=6`.
+- 4-GPU smoke on GPUs 4,5,6,7 completed one G/D update from step 132000 to 132001.
+- Run header confirmed `global_batch=96`, `mix:3.0`, `gan:0.16@72000+ramp0/none@64`, and `phase=joint`.
+- Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.056`, `lf=0.000`, `d=0.652`.
+- Temporary smoke output `/tmp/mot_smoke_gan016_mix3` was removed.
