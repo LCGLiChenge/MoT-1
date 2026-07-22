@@ -227,3 +227,8 @@ Smoke result:
 - Run header confirmed `global_batch=96`, `mix:3.0`, `gan:0.16@72000+ramp0/none@64`, and `phase=joint`.
 - Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.056`, `lf=0.000`, `d=0.652`.
 - Temporary smoke output `/tmp/mot_smoke_gan016_mix3` was removed.
+
+Eval result on 50k validation images, EMA:
+- step 133000: FID 2.57684, PSNR 20.3993, LPIPS 0.19960, L1 0.13789, SSIM 0.50947, tokens 133.51.
+- Compared with direct full-image `lambda_gan=0.16, lambda_mix=2.0` at step 133000 (FID 2.55916, PSNR 20.3476), `lambda_mix=3.0` preserves PSNR better but loses the FID gain.
+- Conclusion: increasing reconstruction weight alone trades away the useful adversarial improvement; this branch is not a better FID direction.
