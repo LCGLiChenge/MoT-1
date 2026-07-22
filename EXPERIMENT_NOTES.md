@@ -126,3 +126,11 @@ Smoke result:
 - Run header confirmed `global_batch=96`, `gan:0.16`, `disc_fm:0.0`, `g_freeze:0`, and `phase=joint`.
 - The smoke step completed G/D update and saved `/tmp/mot_smoke_gan016_bs4/latest.pt`; temporary smoke outputs `/tmp/mot_smoke_gan016` and `/tmp/mot_smoke_gan016_bs4` were removed.
 
+Eval result on 50k validation images, EMA:
+- step 133000: FID 2.55916, PSNR 20.3476, LPIPS 0.19922, L1 0.13875, SSIM 0.50717, tokens 133.50.
+- step 134000: FID 2.57741, PSNR 20.3306, LPIPS 0.19922, L1 0.13909, SSIM 0.50638, tokens 133.50.
+- step 135000: FID 2.55541, PSNR 20.3184, LPIPS 0.19907, L1 0.13928, SSIM 0.50598, tokens 133.50.
+- step 136000: FID 2.55801, PSNR 20.3115, LPIPS 0.19893, L1 0.13937, SSIM 0.50566, tokens 133.50.
+- Interpretation: stronger GAN pressure can reduce FID versus the clean 132000 baseline (FID 2.57319), with best measured FID at 135000, but reconstruction metrics degrade steadily.
+- Conclusion: this is a real but small FID improvement, not enough for the 2.2 target. Treat 135000 as the best gan0.16 checkpoint so far; do not continue this branch blindly unless accepting further PSNR/L1 drift.
+
