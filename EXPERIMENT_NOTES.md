@@ -315,3 +315,30 @@ Smoke result:
 - Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.049`, `d=0.652`, `phase=joint`.
 - Temporary smoke output `/tmp/mot_smoke_gan014_mix2` was removed.
 
+## 2026-07-23 - StyleGAN discriminator probe
+
+Context:
+- Goal: try a more FID-friendly GAN recipe without using Inception/FID features as a training target.
+- We intentionally avoid an Inception feature discriminator because FID itself is computed in Inception feature space and that would look like optimizing the metric proxy.
+- This probe uses the StyleGAN/MaskGIT-style discriminator architecture already present in LlamaGen (`tokenizer/tokenizer_image/discriminator_stylegan.py`) and keeps the rest of the MoT training recipe comparable to the recent `patch_dino + lambda_gan=0.14, lambda_mix=2.0` probe.
+
+Implementation:
+- Added `discriminator_type=stylegan` to `train_titok_llamagen_recon.py` and `train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py`.
+- The implementation follows the LlamaGen StyleGAN discriminator structure; the blur layer is implemented locally with grouped `conv2d` because this environment does not have `kornia` installed.
+- Existing discriminator choices are unchanged.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_styleganD_gan014_mix2_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 134000, save every 500 steps.
+- `discriminator_type=stylegan`, `reset_discriminator=true`, `d_warmup_steps=500`, `lambda_gan=0.14`, `lambda_mix=2.0`.
+- Keep EMA enabled, Router effectively frozen (`lr_router=0`), and 1D adapter frozen (`train_adapter=false`).
+- Local 4-GPU setting uses `batch_size=4`, `accum_steps=6`, global batch 96.
+
+Smoke result:
+- `python3 -m py_compile train_titok_llamagen_recon.py train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py` passed.
+- 4-GPU smoke on GPUs 4,5,6,7 completed one full step from 132000 to 132001 with local data/adapter path overrides.
+- Run header confirmed `disc:stylegan/scales=[1.0]/weights=[1.0]`, `gan:0.14@72000+ramp0/none@64`, `d_warmup:500`, and resume from 132000.
+- Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.000`, `d=1.001`; `gan=0.000` is expected during the discriminator warmup window.
+- Temporary smoke output `/tmp/mot_smoke_styleganD_gan014_mix2` was removed.
+

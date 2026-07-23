@@ -181,6 +181,86 @@ def spectral_linear(in_features, out_features):
     return nn.utils.spectral_norm(nn.Linear(in_features, out_features))
 
 
+class StyleGANDiscriminator(nn.Module):
+    # Same architecture family as LlamaGen tokenizer_image/discriminator_stylegan.py,
+    # with local blur implemented through conv2d to avoid an extra kornia dependency.
+    def __init__(self, input_nc=3, channel_multiplier=1, image_size=256):
+        super().__init__()
+        channels = {
+            4: 512,
+            8: 512,
+            16: 512,
+            32: 512,
+            64: 256 * channel_multiplier,
+            128: 128 * channel_multiplier,
+            256: 64 * channel_multiplier,
+            512: 32 * channel_multiplier,
+            1024: 16 * channel_multiplier,
+        }
+        if image_size not in channels:
+            raise ValueError(f"StyleGANDiscriminator only supports power-of-two sizes in {sorted(channels)}, got {image_size}")
+        log_size = int(math.log(image_size, 2))
+        in_channel = channels[image_size]
+        blocks = [nn.Conv2d(input_nc, in_channel, 3, padding=1), nn.LeakyReLU(0.2, inplace=True)]
+        for i in range(log_size, 2, -1):
+            out_channel = channels[2 ** (i - 1)]
+            blocks.append(StyleGANDiscriminatorBlock(in_channel, out_channel))
+            in_channel = out_channel
+        self.blocks = nn.ModuleList(blocks)
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(in_channel, channels[4], 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.final_linear = nn.Sequential(
+            nn.Linear(channels[4] * 4 * 4, channels[4]),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(channels[4], 1),
+        )
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        x = self.final_conv(x)
+        x = x.view(x.shape[0], -1)
+        return self.final_linear(x)
+
+
+class StyleGANDiscriminatorBlock(nn.Module):
+    def __init__(self, input_channels, filters, downsample=True):
+        super().__init__()
+        self.conv_res = nn.Conv2d(input_channels, filters, 1, stride=(2 if downsample else 1))
+        self.net = nn.Sequential(
+            nn.Conv2d(input_channels, filters, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(filters, filters, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.downsample = nn.Sequential(
+            StyleGANBlur(),
+            nn.Conv2d(filters, filters, 3, padding=1, stride=2),
+        ) if downsample else None
+
+    def forward(self, x):
+        res = self.conv_res(x)
+        x = self.net(x)
+        if self.downsample is not None:
+            x = self.downsample(x)
+        return (x + res) * (1.0 / math.sqrt(2.0))
+
+
+class StyleGANBlur(nn.Module):
+    def __init__(self):
+        super().__init__()
+        filt = torch.tensor([1.0, 2.0, 1.0])
+        filt = filt[:, None] * filt[None, :]
+        filt = filt / filt.sum()
+        self.register_buffer("filt", filt[None, None])
+
+    def forward(self, x):
+        filt = self.filt.to(dtype=x.dtype, device=x.device).repeat(x.shape[1], 1, 1, 1)
+        return F.conv2d(x, filt, padding=1, groups=x.shape[1])
+
+
 class DINOFeatureDiscriminator(nn.Module):
     def __init__(
         self,
@@ -427,6 +507,12 @@ def build_discriminator(args, device):
             dino_input_size=getattr(args, "dino_input_size", 224),
             dino_head_hidden=getattr(args, "dino_head_hidden", 256),
             dino_use_patch_tokens=getattr(args, "dino_use_patch_tokens", True),
+        ).to(device)
+    elif discriminator_type == "stylegan":
+        discriminator = StyleGANDiscriminator(
+            input_nc=3,
+            channel_multiplier=getattr(args, "stylegan_channel_multiplier", 1),
+            image_size=args.image_size,
         ).to(device)
     elif discriminator_type == "multiscale_patch_dino":
         scales = parse_float_sequence(getattr(args, "disc_scales", [1.0, 0.5]), [1.0, 0.5])
@@ -1378,7 +1464,8 @@ def build_parser():
     parser.add_argument("--d-every", type=int, default=1)
     parser.add_argument("--lecam-regularization-weight", type=float, default=0.001)
     parser.add_argument("--lecam-ema-decay", type=float, default=0.999)
-    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "patch_dino", "multiscale_patch_dino"])
+    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "patch_dino", "multiscale_patch_dino", "stylegan"])
+    parser.add_argument("--stylegan-channel-multiplier", type=int, default=1)
     parser.add_argument("--disc-scales", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-loss-weights", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-hidden-channels", type=int, default=128)
