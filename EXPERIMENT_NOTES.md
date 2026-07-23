@@ -449,3 +449,11 @@ Eval result:
 - Local projected D forward/backward test passed on CPU: output logits are four patch maps at 56x56, 28x28, 14x14, and 7x7.
 - 4-GPU smoke passed on GPUs 4,5,6,7 for one step from 132000 to 132001; temporary `/tmp/mot_smoke_projectedconvnextD` output was deleted. The smoke header confirmed `disc:projected_convnext`, `gan:0.1`, `d_warmup:500`, `global_batch=96`.
 - Acceptance rule before longer runs: compare 50k val against the clean 132000/patch+DINO baseline; continue only if PSNR stays at or above 20.35 and FID improves below about 2.57.
+
+
+Projected ConvNeXt D eval update:
+- Log dynamics: D warmup behaves normally. `d_real - d_fake` rises from about 0.04 at step 132050 to about 0.45 at step 132500; after G GAN turns on, the gap settles around 0.27 through step 133000. This means the discriminator is giving nonzero, stable pressure rather than immediately collapsing.
+- 50k ImageNet validation eval:
+  - `step_00132500.pt`: FID 4.34581, PSNR 21.15056, LPIPS 0.22602, L1 0.12712, SSIM 0.54221, tokens 133.64.
+  - `step_00133000.pt`: FID 2.67135, PSNR 20.86730, LPIPS 0.20728, L1 0.13095, SSIM 0.52685, tokens 133.60.
+- Conclusion: projected ConvNeXt D is numerically healthy but not useful as-is. It recovers from reset-D warmup by step 133000, but FID remains worse than the clean patch+DINO baseline and far from the 2.4 target. Do not continue this branch without a more substantial change.
