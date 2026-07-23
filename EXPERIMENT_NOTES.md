@@ -385,3 +385,11 @@ Launch helper:
 - Added `scripts/wait_and_train_dinov1s_gan150.sh`. It polls `nvidia-smi` until four candidate GPUs have memory usage below `MAX_USED_MB` and then launches the probe.
 - Defaults: `NEEDED_GPUS=4`, `MAX_USED_MB=2000`, `CHECK_INTERVAL=60`, `GPU_CANDIDATES=0,1,2,3,4,5,6,7`.
 - Syntax check and no-launch waiting branch test passed. A full smoke test was not run because all GPUs were occupied or had stale contexts at the time.
+
+Eval result:
+- 50k ImageNet validation eval used `eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py`, mix-only path, absolute validation path `/home/heyefei/ImageNet/validation`, and absolute 66000 adapter init.
+- `step_00132500.pt`: FID 4.35880, PSNR 21.15139, LPIPS 0.22606, L1 0.12712, tokens 133.64.
+- `step_00133000.pt`: FID 4.80019, PSNR 21.22234, LPIPS 0.22917, L1 0.12623, tokens 133.66.
+- `step_00133500.pt`: FID 5.16807, PSNR 20.58137, LPIPS 0.22665, L1 0.13745, tokens 133.57.
+- `step_00134000.pt`: FID 3.66588, PSNR 20.67981, LPIPS 0.22202, L1 0.13534, tokens 133.66.
+- Conclusion: `lambda_gan=1.50` with pure DINOv1-S discriminator is not useful. It can keep or raise PSNR on early checkpoints, but FID is far worse than the patch+DINO baseline and worse than the previous DINOv1-S low-weight probe.
