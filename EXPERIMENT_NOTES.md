@@ -456,4 +456,4 @@ Projected ConvNeXt D eval update:
 - 50k ImageNet validation eval:
   - `step_00132500.pt`: FID 4.34581, PSNR 21.15056, LPIPS 0.22602, L1 0.12712, SSIM 0.54221, tokens 133.64.
   - `step_00133000.pt`: FID 2.67135, PSNR 20.86730, LPIPS 0.20728, L1 0.13095, SSIM 0.52685, tokens 133.60.
-- Conclusion: projected ConvNeXt D is numerically healthy but not useful as-is. It recovers from reset-D warmup by step 133000, but FID remains worse than the clean patch+DINO baseline and far from the 2.4 target. Do not continue this branch without a more substantial change.
+- Updated interpretation: `step_00132500.pt` is not a fair rejection point because it is after reset-D warmup with little/no G-side GAN pressure; FID degradation there is expected. The meaningful signal is that after GAN turns on, FID recovers from 4.35 at 132500 to 2.67 at 133000 in only about 500 G-active steps. This branch is not proven better than the clean patch+DINO baseline yet, but it is worth a short continuation probe to 133500/134000 before deciding.
