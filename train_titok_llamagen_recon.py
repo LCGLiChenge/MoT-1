@@ -17,6 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import models, transforms
+from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.datasets import ImageFolder
 
 from models import TiTokLlamaGenStage2
@@ -360,6 +361,102 @@ class DINOFeatureDiscriminator(nn.Module):
         return torch.cat(logits, dim=1)
 
 
+class ProjectedPatchHead(nn.Module):
+    def __init__(self, in_channels, hidden_channels=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.utils.spectral_norm(nn.Conv2d(in_channels, hidden_channels, 1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(hidden_channels, 1, 1)),
+        )
+
+    def forward(self, x):
+        return self.net(x.float())
+
+    def features(self, x):
+        h = x.float()
+        outputs = []
+        for layer in self.net[:-1]:
+            h = layer(h)
+            if isinstance(layer, nn.LeakyReLU):
+                outputs.append(h)
+        outputs.append(self.net[-1](h))
+        return outputs
+
+
+class ProjectedConvNeXtDiscriminator(nn.Module):
+    # Projected-GAN-style D: frozen pretrained ConvNeXt features with trainable patch heads.
+    # The backbone is kept outside registered submodules so optimizers/DDP only see the heads.
+    def __init__(
+        self,
+        input_size=224,
+        hidden_channels=256,
+        feature_nodes=None,
+        loss_weights=None,
+        pretrained=True,
+    ):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.feature_nodes = tuple(feature_nodes or [
+            "features.1.2.add",
+            "features.3.2.add",
+            "features.5.26.add",
+            "features.7.2.add",
+        ])
+        channels_by_node = {
+            "features.1.2.add": 96,
+            "features.3.2.add": 192,
+            "features.5.26.add": 384,
+            "features.7.2.add": 768,
+        }
+        missing = [node for node in self.feature_nodes if node not in channels_by_node]
+        if missing:
+            raise ValueError(f"unsupported projected ConvNeXt feature nodes: {missing}")
+        weights = models.ConvNeXt_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        backbone = models.convnext_small(weights=weights).eval().requires_grad_(False)
+        return_nodes = {node: f"feat_{idx}" for idx, node in enumerate(self.feature_nodes)}
+        self.backbone_proxy = (create_feature_extractor(backbone, return_nodes=return_nodes).eval().requires_grad_(False),)
+        self.loss_weights = tuple(parse_float_sequence(loss_weights, [1.0] * len(self.feature_nodes)))
+        if len(self.loss_weights) != len(self.feature_nodes):
+            raise ValueError(f"projected loss weights length mismatch: {self.loss_weights} vs {self.feature_nodes}")
+        self.heads = nn.ModuleList(
+            ProjectedPatchHead(channels_by_node[node], hidden_channels=hidden_channels)
+            for node in self.feature_nodes
+        )
+        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None])
+        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None])
+
+    def _apply(self, fn, *args, **kwargs):
+        super()._apply(fn, *args, **kwargs)
+        self.backbone_proxy[0]._apply(fn, *args, **kwargs)
+        return self
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone_proxy[0].eval()
+        return self
+
+    def _extract(self, x_01):
+        x = x_01.float()
+        if x.shape[-2:] != (self.input_size, self.input_size):
+            x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
+        x = (x - self.imagenet_mean) / self.imagenet_std
+        return list(self.backbone_proxy[0](x).values())
+
+    def forward(self, x_01):
+        features = self._extract(x_01)
+        return [(head(feat), weight) for head, feat, weight in zip(self.heads, features, self.loss_weights)]
+
+    def discriminator_features(self, x_01):
+        features = self._extract(x_01)
+        outputs = []
+        for head, feat, weight in zip(self.heads, features, self.loss_weights):
+            outputs.extend((item, weight) for item in head.features(feat))
+        return outputs
+
+
 class FrozenDINOFeatureLoss(nn.Module):
     def __init__(
         self,
@@ -559,6 +656,13 @@ def build_discriminator(args, device):
             dino_head_hidden=getattr(args, "dino_head_hidden", 256),
             dino_use_patch_tokens=getattr(args, "dino_use_patch_tokens", True),
         ).to(device)
+    elif discriminator_type == "projected_convnext":
+        discriminator = ProjectedConvNeXtDiscriminator(
+            input_size=getattr(args, "projected_input_size", 224),
+            hidden_channels=getattr(args, "projected_head_hidden", 256),
+            loss_weights=getattr(args, "projected_loss_weights", [1.0, 1.0, 1.0, 1.0]),
+            pretrained=getattr(args, "projected_pretrained", True),
+        ).to(device)
     elif discriminator_type == "stylegan":
         discriminator = StyleGANDiscriminator(
             input_nc=3,
@@ -663,6 +767,8 @@ def _weighted_discriminator_features(discriminator, x):
         return outputs
     if isinstance(discriminator, DINOFeatureDiscriminator):
         return [(feature, 1.0) for feature in _dino_discriminator_features(discriminator, x)]
+    if isinstance(discriminator, ProjectedConvNeXtDiscriminator):
+        return discriminator.discriminator_features(x)
     if hasattr(discriminator, "block_in") and hasattr(discriminator, "blocks") and hasattr(discriminator, "pool"):
         return [(feature, 1.0) for feature in _patch_discriminator_features(discriminator, x)]
     return []
@@ -1515,8 +1621,12 @@ def build_parser():
     parser.add_argument("--d-every", type=int, default=1)
     parser.add_argument("--lecam-regularization-weight", type=float, default=0.001)
     parser.add_argument("--lecam-ema-decay", type=float, default=0.999)
-    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "dino", "dinov1s", "patch_dino", "multiscale_patch_dino", "stylegan"])
+    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "dino", "dinov1s", "patch_dino", "multiscale_patch_dino", "projected_convnext", "stylegan"])
     parser.add_argument("--stylegan-channel-multiplier", type=int, default=1)
+    parser.add_argument("--projected-input-size", type=int, default=224)
+    parser.add_argument("--projected-head-hidden", type=int, default=256)
+    parser.add_argument("--projected-loss-weights", type=float, nargs="*", default=[1.0, 1.0, 1.0, 1.0])
+    parser.add_argument("--projected-pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--disc-scales", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-loss-weights", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-hidden-channels", type=int, default=128)

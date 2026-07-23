@@ -437,3 +437,15 @@ Eval result:
 - 50k ImageNet validation eval for strong patch+DINO `step_00133500.pt` used `eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py`, mix-only path, absolute validation path `/home/heyefei/ImageNet/validation`, and absolute 66000 adapter init.
 - `step_00133500.pt`: FID 3.01408, PSNR 20.25666, LPIPS 0.19535, L1 0.14002, SSIM 0.50867, tokens 133.56.
 - Conclusion: the stronger patch+DINO discriminator kept `d_real - d_fake` positive during the G ramp, unlike pure DINOv1-S, but it did not improve FID enough and PSNR fell below the 20.35 target. This setting is not worth continuing as-is; next variants should reduce G pressure (`lambda_gan` around 0.10-0.12) or lengthen the G ramp while keeping the stronger D.
+
+## 2026-07-23 - Projected ConvNeXt discriminator probe
+
+- Goal: try a more literature-aligned FID-friendly discriminator after pure DINOv1-S, StyleGAN, multiscale Patch+DINO, and stronger Patch+DINO did not reach the FID/PSNR target.
+- Added `discriminator_type=projected_convnext`: a Projected-GAN-style discriminator using frozen pretrained ConvNeXt-S features at four levels (`features.1.2.add`, `features.3.2.add`, `features.5.26.add`, `features.7.2.add`) with trainable spectral-norm patch heads.
+- The frozen ConvNeXt feature extractor is intentionally kept outside registered trainable submodules, so DDP/optimizer only train the projection heads while gradients still flow through the frozen backbone to the generator image.
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_projectedconvnextD_gan010_mix2_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Probe setting: reset discriminator, `lambda_gan=0.10`, `d_warmup_steps=500`, `lambda_mix=2.0`, 1D adapter and Router frozen, low-lr 2D tokenizer/decoder trainable as in the current baseline path.
+- Local projected D forward/backward test passed on CPU: output logits are four patch maps at 56x56, 28x28, 14x14, and 7x7.
+- 4-GPU smoke passed on GPUs 4,5,6,7 for one step from 132000 to 132001; temporary `/tmp/mot_smoke_projectedconvnextD` output was deleted. The smoke header confirmed `disc:projected_convnext`, `gan:0.1`, `d_warmup:500`, `global_batch=96`.
+- Acceptance rule before longer runs: compare 50k val against the clean 132000/patch+DINO baseline; continue only if PSNR stays at or above 20.35 and FID improves below about 2.57.
