@@ -432,3 +432,8 @@ Smoke result:
 - Run header confirmed `gan:0.14@72000+ramp500/g_after_dwarm:True`, `disc:patch_dino`, `dino:dinov2_vits14@0.5`, `d_warmup:1000`, `lr_d=5e-5`, `batch_size_per_gpu=3`, `accum_steps=8`.
 - Progress bar showed `gan=0.000`, `d=1.001`, which is expected during D warmup.
 - Temporary smoke output `/tmp/mot_smoke_strongpatchdinoD_gan014_lrd5e5_gramp500` was removed.
+
+Eval result:
+- 50k ImageNet validation eval for strong patch+DINO `step_00133500.pt` used `eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py`, mix-only path, absolute validation path `/home/heyefei/ImageNet/validation`, and absolute 66000 adapter init.
+- `step_00133500.pt`: FID 3.01408, PSNR 20.25666, LPIPS 0.19535, L1 0.14002, SSIM 0.50867, tokens 133.56.
+- Conclusion: the stronger patch+DINO discriminator kept `d_real - d_fake` positive during the G ramp, unlike pure DINOv1-S, but it did not improve FID enough and PSNR fell below the 20.35 target. This setting is not worth continuing as-is; next variants should reduce G pressure (`lambda_gan` around 0.10-0.12) or lengthen the G ramp while keeping the stronger D.
