@@ -457,3 +457,20 @@ Projected ConvNeXt D eval update:
   - `step_00132500.pt`: FID 4.34581, PSNR 21.15056, LPIPS 0.22602, L1 0.12712, SSIM 0.54221, tokens 133.64.
   - `step_00133000.pt`: FID 2.67135, PSNR 20.86730, LPIPS 0.20728, L1 0.13095, SSIM 0.52685, tokens 133.60.
 - Updated interpretation: `step_00132500.pt` is not a fair rejection point because it is after reset-D warmup with little/no G-side GAN pressure; FID degradation there is expected. The meaningful signal is that after GAN turns on, FID recovers from 4.35 at 132500 to 2.67 at 133000 in only about 500 G-active steps. This branch is not proven better than the clean patch+DINO baseline yet, but it is worth a short continuation probe to 133500/134000 before deciding.
+
+
+## 2026-07-23 - Projected ConvNeXt D lr_d continuation probe
+
+Context:
+- `step_00132500.pt` from the projected ConvNeXt D branch is after reset-D warmup with little/no G-side GAN pressure, so its bad FID is expected and should not be used to reject the branch.
+- After GAN turns on, FID recovers from 4.34581 at step 132500 to 2.67135 at step 133000, which suggests the branch is worth a short continuation.
+
+Change:
+- Continue the same projected ConvNeXt D experiment from `latest.pt` at step 133000 to step 137000.
+- Increase `lr_d` from `2.0e-5` to `5.0e-5`.
+- Set `reset_discriminator=false` and `reset_optimizer=false` so both D and optimizer state continue from the 133000 checkpoint.
+- Keep `lambda_gan=0.10`, `lambda_mix=2.0`, `batch_size=4`, `accum_steps=6`, and `save_every=500`.
+
+Smoke result:
+- 4-GPU smoke on GPUs 4,5,6,7 completed one step from 133000 to 133001 using `/tmp/mot_smoke_projectedconvnextD_lrd5e5_continue` as output.
+- Header confirmed resume from projected ConvNeXt `latest.pt`, full discriminator load, and no D reset. Temporary smoke output was deleted.
