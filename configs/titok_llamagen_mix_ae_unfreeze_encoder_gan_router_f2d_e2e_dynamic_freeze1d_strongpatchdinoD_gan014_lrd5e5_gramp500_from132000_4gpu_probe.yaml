@@ -21,7 +21,7 @@ titok_input_range: zero_1
 llamagen_input_range: minus1_1
 random_crop: false
 random_flip: false
-batch_size: 3
+batch_size: 4
 accum_steps: 8
 max_steps: 134000
 num_workers: 8
@@ -132,7 +132,7 @@ wandb_project: MoT
 wandb_name: mot_strongpatchdinoD_gan014_lrd5e5_gramp500_from132000_4gpu_probe
 wandb_entity: ""
 wandb_mode: ""
-wandb_tags: [local4gpu, probe, from132000, strongpatchdinoD, gan014, lrd5e5, gramp500, mix2, bs3_accum8]
+wandb_tags: [local4gpu, probe, from132000, strongpatchdinoD, gan014, lrd5e5, gramp500, mix2, bs4_accum8]
 
 lg_latent_channels: 256
 lg_head_channels: 256

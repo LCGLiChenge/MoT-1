@@ -423,7 +423,7 @@ Probe setting:
 - New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_strongpatchdinoD_gan014_lrd5e5_gramp500_from132000_4gpu_probe.yaml`.
 - Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
 - `discriminator_type=patch_dino`, `reset_discriminator=true`, `disc_hidden_channels=256`, `disc_num_stages=4`, `dino_head_hidden=512`, `lambda_gan=0.14`, `lr_d=5e-5`, `d_warmup_steps=1000`, `gan_ramp_steps=500`, `gan_g_ramp_after_d_warmup=true`.
-- Local 4-GPU setting uses `batch_size=3`, `accum_steps=8`, global batch 96.
+- Local 4-GPU setting was updated to `batch_size=4`, `accum_steps=8`, global batch 128 after the initial smoke. Any already-running process that was launched before this edit still uses the old `batch_size=3`, `accum_steps=8` values from its startup config.
 
 Smoke result:
 - `python3 -m py_compile train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py train_titok_llamagen_recon.py` passed.
