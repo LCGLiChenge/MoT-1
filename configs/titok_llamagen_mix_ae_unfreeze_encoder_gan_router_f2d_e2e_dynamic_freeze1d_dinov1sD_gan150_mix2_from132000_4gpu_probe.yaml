@@ -21,8 +21,8 @@ titok_input_range: zero_1
 llamagen_input_range: minus1_1
 random_crop: false
 random_flip: false
-batch_size: 4
-accum_steps: 6
+batch_size: 3
+accum_steps: 8
 max_steps: 134000
 num_workers: 8
 limit_samples: 0
