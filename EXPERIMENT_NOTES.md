@@ -412,3 +412,23 @@ Smoke result:
 - Run header confirmed `gan:1.2@72000+ramp500/g_after_dwarm:True`, `lr_d=5e-5`, `batch_size_per_gpu=3`, `accum_steps=8`.
 - Progress bar showed `gan=0.000`, `d=1.013`, which is expected during D warmup.
 - Temporary smoke output `/tmp/mot_smoke_dinov1sD_gan120_lrd5e5_gramp500` was removed.
+
+## 2026-07-23 - Strong patch+DINO discriminator probe
+
+Context:
+- Pure DINOv1-S discriminator was too weak in practice: after D warmup the generator quickly drove `d_real - d_fake` toward zero and then negative, so increasing GAN weight alone produced unstable gradients and poor FID.
+- This probe keeps the more FID-relevant local RGB PatchGAN branch and increases discriminator capacity instead of relying on pure DINO features.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_strongpatchdinoD_gan014_lrd5e5_gramp500_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- `discriminator_type=patch_dino`, `reset_discriminator=true`, `disc_hidden_channels=256`, `disc_num_stages=4`, `dino_head_hidden=512`, `lambda_gan=0.14`, `lr_d=5e-5`, `d_warmup_steps=1000`, `gan_ramp_steps=500`, `gan_g_ramp_after_d_warmup=true`.
+- Local 4-GPU setting uses `batch_size=3`, `accum_steps=8`, global batch 96.
+
+Smoke result:
+- `python3 -m py_compile train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py train_titok_llamagen_recon.py` passed.
+- Initial smoke failed before training because the copied MoT config used relative `dino_repo: ../.cache/torch/hub/facebookresearch_dinov2_main`, which does not exist under `/home/heyefei/lichenge/MoT`. The config was corrected to absolute `/home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main`.
+- 4-GPU smoke on GPUs 4,5,6,7 completed one full step from 132000 to 132001 with local data/adapter path overrides.
+- Run header confirmed `gan:0.14@72000+ramp500/g_after_dwarm:True`, `disc:patch_dino`, `dino:dinov2_vits14@0.5`, `d_warmup:1000`, `lr_d=5e-5`, `batch_size_per_gpu=3`, `accum_steps=8`.
+- Progress bar showed `gan=0.000`, `d=1.001`, which is expected during D warmup.
+- Temporary smoke output `/tmp/mot_smoke_strongpatchdinoD_gan014_lrd5e5_gramp500` was removed.
