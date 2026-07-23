@@ -368,3 +368,20 @@ Smoke result:
 - Run header confirmed `disc:dinov1s/scales=[1.0]/weights=[1.0]`, `dino:dinov1_vits16@0.5`, `d_warmup:1000`, and resume from 132000.
 - Progress bar showed `gan=0.000`, `d=1.007`; `gan=0.000` is expected during the discriminator warmup window.
 - Temporary smoke output `/tmp/mot_smoke_dinov1sD` was removed.
+
+## 2026-07-23 - DINOv1-S GAN 1.5 probe and GPU watcher
+
+Context:
+- Goal: test whether the previous DINOv1-S GAN runs were too weak to affect the generator. Log analysis showed `lambda_gan=0.30` contributed only about 1.3% of total loss and 2.5% of mix reconstruction loss.
+- This probe raises `lambda_gan` to 1.50 so the GAN term should be large enough to visibly affect training dynamics after warmup.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_dinov1sD_gan150_mix2_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- `discriminator_type=dinov1s`, `reset_discriminator=true`, `d_warmup_steps=1000`, `lambda_gan=1.50`, `lambda_mix=2.0`.
+- Run from 132000 to 134000 and save every 500 steps.
+
+Launch helper:
+- Added `scripts/wait_and_train_dinov1s_gan150.sh`. It polls `nvidia-smi` until four candidate GPUs have memory usage below `MAX_USED_MB` and then launches the probe.
+- Defaults: `NEEDED_GPUS=4`, `MAX_USED_MB=2000`, `CHECK_INTERVAL=60`, `GPU_CANDIDATES=0,1,2,3,4,5,6,7`.
+- Syntax check and no-launch waiting branch test passed. A full smoke test was not run because all GPUs were occupied or had stale contexts at the time.
