@@ -285,3 +285,33 @@ Smoke result:
 - Run header confirmed `mix:2.5`, `gan:0.13@72000+ramp0/none@64`, `disc:patch_dino/scales=[1.0]/weights=[1.0]`, and `loaded discriminator from resume (full)`.
 - Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.046`, `d=0.652`, `phase=joint`.
 - Temporary smoke output `/tmp/mot_smoke_gan013_mix25` was removed.
+
+Eval result on 50k validation images, EMA:
+- step 132500: FID 2.58550, PSNR 20.3920, LPIPS 0.19952, L1 0.13799, SSIM 0.50920, tokens 133.51.
+- step 133000: FID 2.58550, PSNR 20.3944, LPIPS 0.19956, L1 0.13797, SSIM 0.50923, tokens 133.51.
+- step 133500: FID 2.57874, PSNR 20.3966, LPIPS 0.19958, L1 0.13795, SSIM 0.50932, tokens 133.50.
+- step 134000: FID 2.58428, PSNR 20.3981, LPIPS 0.19959, L1 0.13793, SSIM 0.50942, tokens 133.51.
+- Conclusion: `lambda_mix=2.5` preserves PSNR safely above 20.35, but FID does not improve; checkpoint weights from this probe were deleted after preserving eval JSON/logs.
+
+
+## 2026-07-23 - PatchDINO GAN 0.14 with mix reconstruction 2.0 probe
+
+Context:
+- `lambda_gan=0.13, lambda_mix=2.5` kept PSNR high but failed to reduce FID.
+- The next probe returns mix reconstruction weight to 2.0 and uses moderate GAN pressure at 0.14 with the stable single-scale Patch+DINO discriminator.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan014_mix2_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 134000, save every 500 steps for early-stop selection.
+- `lambda_gan=0.14`, `lambda_mix=2.0`, `gan_input_filter=none`, `discriminator_type=patch_dino`, `dino_loss_weight=0.50`.
+- Keep inherited D weights (`reset_discriminator=false`), EMA enabled, Router effectively frozen (`lr_router=0`), and 1D adapter frozen (`train_adapter=false`).
+- Local 4-GPU setting uses `batch_size=4`, `accum_steps=6`, global batch 96.
+
+Smoke result:
+- Initial smoke attempts exposed only local path issues in the portable MoT config: missing `../ImageNet/train`, `weights/step_00066000.pt`, and relative DINO hub repo. These were handled by CLI overrides on this machine.
+- 4-GPU smoke on GPUs 4,5,6,7 completed one full G/D update from step 132000 to 132001.
+- Run header confirmed `mix:2.0`, `gan:0.14@72000+ramp0/none@64`, `disc:patch_dino/scales=[1.0]/weights=[1.0]`, and `loaded discriminator from resume (full)`.
+- Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.049`, `d=0.652`, `phase=joint`.
+- Temporary smoke output `/tmp/mot_smoke_gan014_mix2` was removed.
+
