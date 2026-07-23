@@ -92,6 +92,19 @@ def compute_lowfreq_anchor_loss(pred, target, image_range, low_size):
         target_01 = F.interpolate(target_01.float(), size=(low_size, low_size), mode="bilinear", align_corners=False, antialias=True)
     return F.l1_loss(pred_01.float(), target_01.float())
 
+def gan_g_factor_for_step(args, step, d_warmup_end_step):
+    if not getattr(args, "gan_g_ramp_after_d_warmup", False):
+        return gan_factor_for_step(args, step)
+    if args.lambda_gan <= 0.0:
+        return 0.0
+    if step <= d_warmup_end_step:
+        return 0.0
+    if args.gan_ramp_steps <= 0:
+        return args.discriminator_factor
+    ramp = min(1.0, max(0.0, float(step - d_warmup_end_step) / float(args.gan_ramp_steps)))
+    return args.discriminator_factor * ramp
+
+
 def format_run_header(args, dataset_len, world_size, trainable_params):
     effective_batch = args.batch_size * world_size * args.accum_steps
     summary = (
@@ -107,7 +120,8 @@ def format_run_header(args, dataset_len, world_size, trainable_params):
         f"perceptual({args.perceptual_loss}):{get_perceptual_weight(args)},feat:{args.lambda_feat},"
         f"feat_moment:{args.lambda_feat_moment},dino_feat:{args.lambda_dino_feat}/{args.dino_feat_loss},"
         f"disc_fm:{args.lambda_disc_feature_matching},lowfreq_anchor:{args.lambda_lowfreq_anchor}@{args.lowfreq_anchor_size},"
-        f"gan:{args.lambda_gan}@{args.gan_start_step}+ramp{args.gan_ramp_steps}/{args.gan_input_filter}@{args.gan_highpass_size},"
+        f"gan:{args.lambda_gan}@{args.gan_start_step}+ramp{args.gan_ramp_steps}/"
+        f"g_after_dwarm:{getattr(args, 'gan_g_ramp_after_d_warmup', False)}/{args.gan_input_filter}@{args.gan_highpass_size},"
         f"disc:{args.discriminator_type}/scales={args.disc_scales}/weights={args.disc_loss_weights},"
         f"dino:{args.dino_model}@{args.dino_loss_weight},"
         f"d_every:{args.d_every},d_warmup:{args.d_warmup_steps},g_freeze:{args.g_freeze_steps},lecam:{args.lecam_regularization_weight} "
@@ -991,6 +1005,9 @@ def main(args):
         if router_only_active and args.router_only_disable_gan:
             gan_factor = 0.0
         d_warmup_active = discriminator is not None and args.d_warmup_steps > 0 and step <= d_warmup_end_step
+        gan_g_factor = gan_g_factor_for_step(args, step, d_warmup_end_step)
+        if router_only_active and args.router_only_disable_gan:
+            gan_g_factor = 0.0
         train_discriminator = discriminator is not None and gan_factor > 0.0 and step % args.d_every == 0
         optimizer.zero_grad(set_to_none=True)
         if optimizer_d is not None:
@@ -1200,7 +1217,7 @@ def main(args):
                 mix_native_loss = args.lambda_mix_native * (mix_native_img + args.lambda_mix_native_perceptual * mix_native_lp)
                 gan_g_loss = x_mix.new_zeros(())
                 disc_fm_loss = x_mix.new_zeros(())
-                if discriminator is not None and gan_factor > 0.0 and not d_warmup_active:
+                if discriminator is not None and gan_g_factor > 0.0 and not d_warmup_active:
                     set_requires_grad(discriminator, False)
                     fake_for_g, real_for_g = prepare_gan_inputs(
                         x_mix,
@@ -1223,7 +1240,7 @@ def main(args):
                     + args.lambda_dino_feat * dino_feat_loss
                     + args.lambda_lowfreq_anchor * lowfreq_anchor_loss
                     + args.lambda_disc_feature_matching * disc_fm_loss
-                    + args.lambda_gan * gan_factor * gan_g_loss
+                    + args.lambda_gan * gan_g_factor * gan_g_loss
                     + args.lambda_router_budget * router_budget_loss
                     + args.lambda_router_binary * router_binary_loss
                     + args.lambda_router_ratio_target * router_ratio_target_loss
@@ -1288,7 +1305,7 @@ def main(args):
             metric_sums["feat"] += feat_loss.detach().float().item()
             metric_sums["feat_moment"] += feat_moment.detach().float().item()
             metric_sums["dino_feat"] += dino_feat_loss.detach().float().item()
-            metric_sums["gan_g"] += (args.lambda_gan * gan_factor * gan_g_loss).detach().float().item()
+            metric_sums["gan_g"] += (args.lambda_gan * gan_g_factor * gan_g_loss).detach().float().item()
             metric_sums["disc_fm"] += (args.lambda_disc_feature_matching * disc_fm_loss).detach().float().item()
             metric_sums["lowfreq_anchor"] += (args.lambda_lowfreq_anchor * lowfreq_anchor_loss).detach().float().item()
             metric_sums["d_loss"] += d_loss.detach().float().item()
@@ -1637,6 +1654,7 @@ def build_parser():
     parser.add_argument("--lambda-gan", type=float, default=0.0)
     parser.add_argument("--gan-start-step", type=int, default=0)
     parser.add_argument("--gan-ramp-steps", type=int, default=0)
+    parser.add_argument("--gan-g-ramp-after-d-warmup", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gan-input-filter", type=str, default="none", choices=["none", "highfreq_composite", "highfreq_grad_only"])
     parser.add_argument("--gan-highpass-size", type=int, default=64)
     parser.add_argument("--discriminator-factor", type=float, default=1.0)

@@ -393,3 +393,22 @@ Eval result:
 - `step_00133500.pt`: FID 5.16807, PSNR 20.58137, LPIPS 0.22665, L1 0.13745, tokens 133.57.
 - `step_00134000.pt`: FID 3.66588, PSNR 20.67981, LPIPS 0.22202, L1 0.13534, tokens 133.66.
 - Conclusion: `lambda_gan=1.50` with pure DINOv1-S discriminator is not useful. It can keep or raise PSNR on early checkpoints, but FID is far worse than the patch+DINO baseline and worse than the previous DINOv1-S low-weight probe.
+
+## 2026-07-23 - DINOv1-S GAN 1.2 with stronger D and G-side ramp
+
+Context:
+- The previous `DINOv1-S D + lambda_gan=1.50` probe showed FID recovery at the end, but the D/G dynamics were unhealthy: after D warmup, `d_real - d_fake` became negative and the generator appeared to exploit a weak/reset D.
+- Deleted the generated `gan150` checkpoint weights (`latest.pt`, `step_00132500.pt`, `step_00133000.pt`, `step_00133500.pt`, `step_00134000.pt`) after preserving eval JSON and log files.
+
+Implementation:
+- Added `--gan-g-ramp-after-d-warmup` to `train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py`. D still trains according to `gan_factor`, while the generator GAN loss can ramp separately after the reset-D warmup window.
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_dinov1sD_gan120_lrd5e5_gramp500_from132000_4gpu_probe.yaml`.
+- Setting: resume from clean `step_00132000.pt`, `lambda_gan=1.20`, `lr_d=5e-5`, `d_warmup_steps=1000`, `gan_ramp_steps=500`, `gan_g_ramp_after_d_warmup=true`, `batch_size=3`, `accum_steps=8`.
+- Expected G-side factor: 0 through step 133000, 0.5 at step 133250, and 1.0 from step 133500 onward.
+
+Smoke result:
+- `python3 -m py_compile train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py` passed.
+- 4-GPU smoke on GPUs 4,5,6,7 completed one full step from 132000 to 132001 with local data/adapter path overrides.
+- Run header confirmed `gan:1.2@72000+ramp500/g_after_dwarm:True`, `lr_d=5e-5`, `batch_size_per_gpu=3`, `accum_steps=8`.
+- Progress bar showed `gan=0.000`, `d=1.013`, which is expected during D warmup.
+- Temporary smoke output `/tmp/mot_smoke_dinov1sD_gan120_lrd5e5_gramp500` was removed.
