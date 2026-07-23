@@ -503,3 +503,20 @@ Interpretation:
 - After G-side GAN pressure is active, continuing with `lr_d=5e-5` improves FID from 2.67135 at 133000 to about 2.52 by 136500-137000.
 - PSNR also recovers slightly instead of degrading, from 20.86730 at 133000 to 20.93426 at 137000.
 - The branch has not reached the 2.4 FID target yet, but the trend is positive and no longer looks like a dead end.
+
+
+## 2026-07-24 - Projected ConvNeXt D continue to 145000
+
+Cleanup:
+- Deleted old projected ConvNeXt D checkpoint weights from step 132500 through step 136000 after preserving all eval JSON files.
+- Kept `step_00136500.pt`, `step_00137000.pt`, and `latest.pt`.
+
+Continuation setting:
+- Continue from projected ConvNeXt D `latest.pt` at step 137000.
+- Target `max_steps=145000`, i.e. another 8000 steps.
+- Use explicit `save_steps=[139000, 141000, 143000, 145000]` and `save_every=0` so checkpoint saves are exactly every 2000 steps from the 137000 resume point.
+- Keep `lr_d=5e-5`, `lambda_gan=0.10`, `lambda_mix=2.0`, `batch_size=4`, `accum_steps=6`, `reset_discriminator=false`, and `reset_optimizer=false`.
+
+Smoke result:
+- 4-GPU smoke on GPUs 4,5,6,7 completed one step from 137000 to 137001 using `/tmp/mot_smoke_projectedconvnextD_to145000` as output.
+- Header confirmed full discriminator resume from `latest.pt` at step 137000. Temporary smoke output was deleted.

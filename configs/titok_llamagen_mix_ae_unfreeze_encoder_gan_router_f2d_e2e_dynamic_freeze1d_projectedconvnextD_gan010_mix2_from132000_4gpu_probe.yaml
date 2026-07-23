@@ -23,7 +23,7 @@ random_crop: false
 random_flip: false
 batch_size: 4
 accum_steps: 6
-max_steps: 137000
+max_steps: 145000
 num_workers: 8
 limit_samples: 0
 
@@ -123,11 +123,11 @@ dino_use_patch_tokens: true
 
 log_every: 50
 sample_every: 0
-save_every: 500
+save_every: 0
 latest_every_epoch: false
 save_epoch_every: 0
 save_step_checkpoints: true
-save_steps: []
+save_steps: [139000, 141000, 143000, 145000]
 sample_images: 0
 
 wandb: false
