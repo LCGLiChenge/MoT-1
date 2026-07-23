@@ -474,3 +474,32 @@ Change:
 Smoke result:
 - 4-GPU smoke on GPUs 4,5,6,7 completed one step from 133000 to 133001 using `/tmp/mot_smoke_projectedconvnextD_lrd5e5_continue` as output.
 - Header confirmed resume from projected ConvNeXt `latest.pt`, full discriminator load, and no D reset. Temporary smoke output was deleted.
+
+
+## 2026-07-24 - Projected ConvNeXt D lr_d continuation eval
+
+Eval protocol:
+- 50k ImageNet validation, mix-only path, same `eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py` protocol as previous runs.
+- Adapter init uses the absolute 66000 checkpoint from version4.
+- Checkpoints from the projected ConvNeXt D continuation branch were evaluated in two 4-GPU batches.
+
+Results:
+
+| step | FID | PSNR | LPIPS | L1 | SSIM | tokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 132500 | 4.34581 | 21.15056 | 0.22602 | 0.12712 | 0.54221 | 133.64 |
+| 133000 | 2.67135 | 20.86730 | 0.20728 | 0.13095 | 0.52685 | 133.60 |
+| 133500 | 2.61941 | 20.86270 | 0.20642 | 0.13093 | 0.52680 | 133.61 |
+| 134000 | 2.59031 | 20.87378 | 0.20646 | 0.13081 | 0.52737 | 133.62 |
+| 134500 | 2.58188 | 20.88102 | 0.20623 | 0.13070 | 0.52734 | 133.62 |
+| 135000 | 2.54489 | 20.88723 | 0.20595 | 0.13054 | 0.52769 | 133.62 |
+| 135500 | 2.53066 | 20.90502 | 0.20576 | 0.13021 | 0.52824 | 133.62 |
+| 136000 | 2.52772 | 20.91098 | 0.20557 | 0.13000 | 0.52841 | 133.65 |
+| 136500 | 2.51763 | 20.92721 | 0.20577 | 0.12977 | 0.52866 | 133.63 |
+| 137000 | 2.51945 | 20.93426 | 0.20546 | 0.12962 | 0.52904 | 133.64 |
+
+Interpretation:
+- The 132500 checkpoint remains a D-warmup/no-G-pressure point and should not be used as the branch quality estimate.
+- After G-side GAN pressure is active, continuing with `lr_d=5e-5` improves FID from 2.67135 at 133000 to about 2.52 by 136500-137000.
+- PSNR also recovers slightly instead of degrading, from 20.86730 at 133000 to 20.93426 at 137000.
+- The branch has not reached the 2.4 FID target yet, but the trend is positive and no longer looks like a dead end.
