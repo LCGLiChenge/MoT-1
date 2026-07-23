@@ -342,3 +342,29 @@ Smoke result:
 - Progress bar showed `mix_l1=0.130`, `mix_lp=0.299`, `psnr=19.75`, `base=16.57`, `mask=0.51`, `tok=130`, `gan=0.000`, `d=1.001`; `gan=0.000` is expected during the discriminator warmup window.
 - Temporary smoke output `/tmp/mot_smoke_styleganD_gan014_mix2` was removed.
 
+## 2026-07-23 - DINOv1-S feature discriminator probe
+
+Context:
+- Goal: try a 2025-style VFM discriminator without using Inception/FID feature space as a training target.
+- This branch follows the VFMTok-style idea more closely than `patch_dino`: the discriminator is a pure frozen DINOv1-S/16 feature discriminator with trainable spectral-norm heads on CLS and patch tokens, not PatchGAN plus DINOv2.
+- StyleGAN probe checkpoint weights were deleted after preserving eval JSON/logs because its FID degraded from 2.80 to 3.27.
+
+Implementation:
+- Added DINOv1-S backbone support in `train_titok_llamagen_recon.py` via timm `vit_small_patch16_224` and local checkpoint `/home/heyefei/.cache/torch/hub/checkpoints/dino_deitsmall16_pretrain.pth`.
+- Added `discriminator_type` choices `dino` and `dinov1s`. `dinov1s` forces the DINOv1-S/16 backbone and outputs one CLS logit plus patch-token logits.
+- Added `--dino-ckpt` to both training scripts. Existing `patch_dino` and `multiscale_patch_dino` behavior is unchanged.
+
+Probe setting:
+- New config: `configs/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_dinov1sD_gan014_mix2_from132000_4gpu_probe.yaml`.
+- Resume checkpoint: `results/titok_llamagen_mix_ae_unfreeze_encoder_gan_router_f2d_e2e_dynamic_freeze1d_patchdinoD_gan012_from129360_to137360_local4gpu_bs4_accum6/step_00132000.pt`.
+- Run from 132000 to 134000, save every 500 steps.
+- `discriminator_type=dinov1s`, `reset_discriminator=true`, `d_warmup_steps=1000`, `lambda_gan=0.14`, `lambda_mix=2.0`, `lr_d=2e-5`.
+- Keep EMA enabled, Router effectively frozen (`lr_router=0`), and 1D adapter frozen (`train_adapter=false`).
+
+Smoke result:
+- `python3 -m py_compile train_titok_llamagen_recon.py train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py` passed.
+- Local dummy forward verified DINOv1-S loads without missing/unexpected keys and returns logits with shape `[B, 197]`.
+- 4-GPU smoke on GPUs 4,5,6,7 completed one full step from 132000 to 132001 with local data/adapter path overrides.
+- Run header confirmed `disc:dinov1s/scales=[1.0]/weights=[1.0]`, `dino:dinov1_vits16@0.5`, `d_warmup:1000`, and resume from 132000.
+- Progress bar showed `gan=0.000`, `d=1.007`; `gan=0.000` is expected during the discriminator warmup window.
+- Temporary smoke output `/tmp/mot_smoke_dinov1sD` was removed.

@@ -22,6 +22,10 @@ from torchvision.datasets import ImageFolder
 from models import TiTokLlamaGenStage2
 
 
+DINO_V1_MODEL_ALIASES = {"dinov1_vits16", "dino_vits16", "dino_deitsmall16"}
+DEFAULT_DINO_V1_CKPT = "/home/heyefei/.cache/torch/hub/checkpoints/dino_deitsmall16_pretrain.pth"
+
+
 def add_path(path):
     path = str(path)
     if path not in sys.path:
@@ -181,6 +185,47 @@ def spectral_linear(in_features, out_features):
     return nn.utils.spectral_norm(nn.Linear(in_features, out_features))
 
 
+def load_dino_backbone(dino_repo, dino_model, dino_ckpt=None):
+    dino_model = str(dino_model)
+    if dino_model in DINO_V1_MODEL_ALIASES:
+        import timm
+
+        backbone = timm.create_model("vit_small_patch16_224", pretrained=False, num_classes=0)
+        ckpt_path = dino_ckpt or DEFAULT_DINO_V1_CKPT
+        state = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(state, dict) and "teacher" in state:
+            state = state["teacher"]
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        state = {
+            key.replace("module.", "").replace("backbone.", ""): value
+            for key, value in state.items()
+            if not key.startswith("head.")
+        }
+        missing, unexpected = backbone.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"failed to load DINOv1-S checkpoint {ckpt_path}: "
+                f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+            )
+        return backbone, "dinov1", int(getattr(backbone, "num_features", 384))
+    if not dino_repo:
+        raise ValueError("dino_repo must point to a local torch hub DINOv2 repo")
+    backbone = torch.hub.load(str(dino_repo), dino_model, source="local", pretrained=True)
+    return backbone, "dinov2", int(getattr(backbone, "embed_dim", 384))
+
+
+def extract_dino_tokens(backbone, family, x):
+    features = backbone.forward_features(x)
+    if family == "dinov1":
+        if not torch.is_tensor(features) or features.ndim != 3 or features.shape[1] < 2:
+            raise RuntimeError("DINOv1 backbone must return token tensor [B, N+1, C]")
+        return features[:, 0], features[:, 1:]
+    if not isinstance(features, dict) or "x_norm_clstoken" not in features:
+        raise RuntimeError("DINOv2 backbone must return forward_features with x_norm_clstoken")
+    return features["x_norm_clstoken"], features.get("x_norm_patchtokens")
+
+
 class StyleGANDiscriminator(nn.Module):
     # Same architecture family as LlamaGen tokenizer_image/discriminator_stylegan.py,
     # with local blur implemented through conv2d to avoid an extra kornia dependency.
@@ -266,6 +311,7 @@ class DINOFeatureDiscriminator(nn.Module):
         self,
         dino_repo,
         dino_model="dinov2_vits14",
+        dino_ckpt=None,
         input_size=224,
         hidden_dim=256,
         use_patch_tokens=True,
@@ -273,12 +319,9 @@ class DINOFeatureDiscriminator(nn.Module):
         super().__init__()
         self.input_size = int(input_size)
         self.use_patch_tokens = bool(use_patch_tokens)
-        if not dino_repo:
-            raise ValueError("dino_repo must point to a local torch hub DINOv2 repo")
-        backbone = torch.hub.load(str(dino_repo), str(dino_model), source="local", pretrained=True)
+        backbone, self.dino_family, embed_dim = load_dino_backbone(dino_repo, dino_model, dino_ckpt=dino_ckpt)
         backbone.eval().requires_grad_(False)
         self.dino_proxy = (backbone,)
-        embed_dim = int(getattr(backbone, "embed_dim", 384))
         self.cls_head = nn.Sequential(
             nn.LayerNorm(embed_dim),
             spectral_linear(embed_dim, hidden_dim),
@@ -309,12 +352,8 @@ class DINOFeatureDiscriminator(nn.Module):
         if x.shape[-2:] != (self.input_size, self.input_size):
             x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
         x = (x - self.imagenet_mean) / self.imagenet_std
-        features = self.dino_proxy[0].forward_features(x)
-        if not isinstance(features, dict) or "x_norm_clstoken" not in features:
-            raise RuntimeError("DINO backbone must return forward_features with x_norm_clstoken")
-        cls_token = features["x_norm_clstoken"]
+        cls_token, patch_tokens = extract_dino_tokens(self.dino_proxy[0], self.dino_family, x)
         logits = [self.cls_head(cls_token)]
-        patch_tokens = features.get("x_norm_patchtokens")
         if self.use_patch_tokens and patch_tokens is not None:
             patch_logits = self.patch_head(patch_tokens).squeeze(-1)
             logits.append(patch_logits)
@@ -326,6 +365,7 @@ class FrozenDINOFeatureLoss(nn.Module):
         self,
         dino_repo,
         dino_model="dinov2_vits14",
+        dino_ckpt=None,
         input_size=224,
         use_patch_tokens=True,
         loss_type="l1",
@@ -338,9 +378,7 @@ class FrozenDINOFeatureLoss(nn.Module):
         self.normalize_features = bool(normalize_features)
         if self.loss_type not in {"l1", "l2"}:
             raise ValueError(f"unsupported dino feature loss_type {loss_type}")
-        if not dino_repo:
-            raise ValueError("dino_repo must point to a local torch hub DINOv2 repo")
-        backbone = torch.hub.load(str(dino_repo), str(dino_model), source="local", pretrained=True)
+        backbone, self.dino_family, _embed_dim = load_dino_backbone(dino_repo, dino_model, dino_ckpt=dino_ckpt)
         backbone.eval().requires_grad_(False)
         self.dino_proxy = (backbone,)
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None])
@@ -361,11 +399,8 @@ class FrozenDINOFeatureLoss(nn.Module):
         if x.shape[-2:] != (self.input_size, self.input_size):
             x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
         x = (x - self.imagenet_mean) / self.imagenet_std
-        features = self.dino_proxy[0].forward_features(x)
-        if not isinstance(features, dict) or "x_norm_clstoken" not in features:
-            raise RuntimeError("DINO backbone must return forward_features with x_norm_clstoken")
-        outputs = [features["x_norm_clstoken"]]
-        patch_tokens = features.get("x_norm_patchtokens")
+        cls_token, patch_tokens = extract_dino_tokens(self.dino_proxy[0], self.dino_family, x)
+        outputs = [cls_token]
         if self.use_patch_tokens and patch_tokens is not None:
             outputs.append(patch_tokens)
         if self.normalize_features:
@@ -397,6 +432,7 @@ def build_dino_feature_loss(args, device):
     loss = FrozenDINOFeatureLoss(
         dino_repo=getattr(args, "dino_repo", "../.cache/torch/hub/facebookresearch_dinov2_main"),
         dino_model=getattr(args, "dino_model", "dinov2_vits14"),
+        dino_ckpt=getattr(args, "dino_ckpt", None),
         input_size=getattr(args, "dino_feat_input_size", getattr(args, "dino_input_size", 224)),
         use_patch_tokens=getattr(args, "dino_feat_use_patch_tokens", True),
         loss_type=getattr(args, "dino_feat_loss", "l1"),
@@ -418,6 +454,7 @@ class PatchAndDINOFeatureDiscriminator(nn.Module):
         dino_loss_weight=0.25,
         dino_repo="../.cache/torch/hub/facebookresearch_dinov2_main",
         dino_model="dinov2_vits14",
+        dino_ckpt=None,
         dino_input_size=224,
         dino_head_hidden=256,
         dino_use_patch_tokens=True,
@@ -434,6 +471,7 @@ class PatchAndDINOFeatureDiscriminator(nn.Module):
         self.dino_discriminator = DINOFeatureDiscriminator(
             dino_repo=dino_repo,
             dino_model=dino_model,
+            dino_ckpt=dino_ckpt,
             input_size=dino_input_size,
             hidden_dim=dino_head_hidden,
             use_patch_tokens=dino_use_patch_tokens,
@@ -495,6 +533,18 @@ def build_discriminator(args, device):
             hidden_channels=args.disc_hidden_channels,
             num_stages=args.disc_num_stages,
         ).to(device)
+    elif discriminator_type in {"dino", "dinov1s"}:
+        dino_model = getattr(args, "dino_model", "dinov2_vits14")
+        if discriminator_type == "dinov1s":
+            dino_model = "dinov1_vits16"
+        discriminator = DINOFeatureDiscriminator(
+            dino_repo=getattr(args, "dino_repo", "../.cache/torch/hub/facebookresearch_dinov2_main"),
+            dino_model=dino_model,
+            dino_ckpt=getattr(args, "dino_ckpt", None),
+            input_size=getattr(args, "dino_input_size", 224),
+            hidden_dim=getattr(args, "dino_head_hidden", 256),
+            use_patch_tokens=getattr(args, "dino_use_patch_tokens", True),
+        ).to(device)
     elif discriminator_type == "patch_dino":
         discriminator = PatchAndDINOFeatureDiscriminator(
             NLayerDiscriminator,
@@ -504,6 +554,7 @@ def build_discriminator(args, device):
             dino_loss_weight=getattr(args, "dino_loss_weight", 0.25),
             dino_repo=getattr(args, "dino_repo", "../.cache/torch/hub/facebookresearch_dinov2_main"),
             dino_model=getattr(args, "dino_model", "dinov2_vits14"),
+            dino_ckpt=getattr(args, "dino_ckpt", None),
             dino_input_size=getattr(args, "dino_input_size", 224),
             dino_head_hidden=getattr(args, "dino_head_hidden", 256),
             dino_use_patch_tokens=getattr(args, "dino_use_patch_tokens", True),
@@ -532,6 +583,7 @@ def build_discriminator(args, device):
             dino_loss_weight=getattr(args, "dino_loss_weight", 0.25),
             dino_repo=getattr(args, "dino_repo", "../.cache/torch/hub/facebookresearch_dinov2_main"),
             dino_model=getattr(args, "dino_model", "dinov2_vits14"),
+            dino_ckpt=getattr(args, "dino_ckpt", None),
             dino_input_size=getattr(args, "dino_input_size", 224),
             dino_head_hidden=getattr(args, "dino_head_hidden", 256),
             dino_use_patch_tokens=getattr(args, "dino_use_patch_tokens", True),
@@ -584,11 +636,8 @@ def _dino_discriminator_features(discriminator, x_01):
             antialias=True,
         )
     x = (x - discriminator.imagenet_mean) / discriminator.imagenet_std
-    features = discriminator.dino_proxy[0].forward_features(x)
-    if not isinstance(features, dict) or "x_norm_clstoken" not in features:
-        raise RuntimeError("DINO backbone must return forward_features with x_norm_clstoken")
-    outputs = [_dino_head_hidden(discriminator.cls_head, features["x_norm_clstoken"])]
-    patch_tokens = features.get("x_norm_patchtokens")
+    cls_token, patch_tokens = extract_dino_tokens(discriminator.dino_proxy[0], discriminator.dino_family, x)
+    outputs = [_dino_head_hidden(discriminator.cls_head, cls_token)]
     if discriminator.use_patch_tokens and patch_tokens is not None:
         outputs.append(_dino_head_hidden(discriminator.patch_head, patch_tokens))
     return outputs
@@ -612,6 +661,8 @@ def _weighted_discriminator_features(discriminator, x):
             outputs.append((feature, discriminator.patch_loss_weight * float(weight)))
         outputs.extend((feature, discriminator.dino_loss_weight) for feature in _dino_discriminator_features(discriminator.dino_discriminator, x))
         return outputs
+    if isinstance(discriminator, DINOFeatureDiscriminator):
+        return [(feature, 1.0) for feature in _dino_discriminator_features(discriminator, x)]
     if hasattr(discriminator, "block_in") and hasattr(discriminator, "blocks") and hasattr(discriminator, "pool"):
         return [(feature, 1.0) for feature in _patch_discriminator_features(discriminator, x)]
     return []
@@ -1464,7 +1515,7 @@ def build_parser():
     parser.add_argument("--d-every", type=int, default=1)
     parser.add_argument("--lecam-regularization-weight", type=float, default=0.001)
     parser.add_argument("--lecam-ema-decay", type=float, default=0.999)
-    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "patch_dino", "multiscale_patch_dino", "stylegan"])
+    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "dino", "dinov1s", "patch_dino", "multiscale_patch_dino", "stylegan"])
     parser.add_argument("--stylegan-channel-multiplier", type=int, default=1)
     parser.add_argument("--disc-scales", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-loss-weights", type=float, nargs="*", default=[1.0])
@@ -1472,6 +1523,7 @@ def build_parser():
     parser.add_argument("--disc-num-stages", type=int, default=3)
     parser.add_argument("--dino-repo", type=str, default="../.cache/torch/hub/facebookresearch_dinov2_main")
     parser.add_argument("--dino-model", type=str, default="dinov2_vits14")
+    parser.add_argument("--dino-ckpt", type=str, default=None)
     parser.add_argument("--dino-input-size", type=int, default=224)
     parser.add_argument("--dino-loss-weight", type=float, default=0.25)
     parser.add_argument("--dino-head-hidden", type=int, default=256)
