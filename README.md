@@ -50,7 +50,7 @@ weights/epoch_0005_step_00127360.pt
 If they are not already local, download them from the private Hugging Face checkpoint repo into this repo root. Example:
 
 ```bash
-HF_HUB_DISABLE_XET=1 hf download sophiaa/MoT-1-checkpoints \
+HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 \
   weights/step_00066000.pt \
   weights/epoch_0005_step_00127360.pt \
   --repo-type model \
