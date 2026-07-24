@@ -22,10 +22,11 @@ Current H200 config:
 - `batch_size=32`, `accum_steps=1`
 - `lambda_gan=0.10`, `lambda_mix=2.0`
 - `discriminator_type=projected_convnext`
-- `lr_d=5e-5`, `d_warmup_steps=500`
+- `lr_d=5e-5`, `d_warmup_steps=500` after resetting the projected ConvNeXt discriminator
 - `use_ema=true`, `ema_decay=0.999`
 - `latest.pt` is updated every epoch.
-- Extra step checkpoints are saved at explicit steps in the yaml.
+- Train from step 127360 to `max_steps=152385`, about 5 more epochs on ImageNet.
+- Extra step checkpoints are saved at explicit steps in the yaml, including final step 152385.
 
 Known local result before H200 migration:
 - Projected ConvNeXt branch around 136500-137000 gave the best recent FID/PSNR tradeoff.

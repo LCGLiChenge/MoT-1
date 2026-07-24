@@ -19,7 +19,7 @@ random_crop: false
 random_flip: false
 batch_size: 32
 accum_steps: 1
-max_steps: 145000
+max_steps: 152385
 num_workers: 12
 limit_samples: 0
 
@@ -132,7 +132,7 @@ save_every: 0
 latest_every_epoch: true
 save_epoch_every: 5
 save_step_checkpoints: true
-save_steps: [129360, 131360, 133360, 135360, 137360, 139360, 141360, 143360, 145000]
+save_steps: [129360, 131360, 133360, 135360, 137360, 139360, 141360, 143360, 145360, 147360, 149360, 151360, 152385]
 
 wandb: true
 wandb_project: MoT

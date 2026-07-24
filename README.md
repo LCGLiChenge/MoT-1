@@ -109,7 +109,7 @@ torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_rout
   --config configs/h200_projectedconvnext_from_epoch5.yaml
 ```
 
-This uses `batch_size=32`, `accum_steps=1`, resets optimizer and discriminator for the projected ConvNeXt branch, keeps the 1D adapter frozen, effectively freezes Router with `lr_router=0`, trains the 2D tokenizer/decoder at low LR, uses EMA, updates `latest.pt` every epoch, and saves explicit step checkpoints listed in the yaml.
+This uses `batch_size=32`, `accum_steps=1`, resumes from step 127360 and trains to `max_steps=152385` (about 5 more epochs on ImageNet). It resets optimizer and discriminator for the projected ConvNeXt branch, runs a 500-step D warmup via `d_warmup_steps=500`, keeps the 1D adapter frozen, effectively freezes Router with `lr_router=0`, trains the 2D tokenizer/decoder at low LR, uses EMA, updates `latest.pt` every epoch, and saves explicit step checkpoints listed in the yaml.
 
 ## 8. Eval
 
@@ -125,6 +125,6 @@ For a specific checkpoint:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
   --config configs/eval_projectedconvnext_50000.yaml \
-  --ckpt results/projectedconvnext_from_epoch5_h200_8gpu/step_00145000.pt \
-  --output-json results/projectedconvnext_from_epoch5_h200_8gpu/eval_step_00145000_50000.json
+  --ckpt results/projectedconvnext_from_epoch5_h200_8gpu/step_00152385.pt \
+  --output-json results/projectedconvnext_from_epoch5_h200_8gpu/eval_step_00152385_50000.json
 ```
