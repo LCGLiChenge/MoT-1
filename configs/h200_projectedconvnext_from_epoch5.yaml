@@ -105,7 +105,7 @@ gan_highpass_size: 64
 discriminator_factor: 1.0
 lr_d: 5.0e-5
 d_every: 1
-d_warmup_steps: 500
+d_warmup_steps: 200
 g_freeze_steps: 0
 lecam_regularization_weight: 0.001
 lecam_ema_decay: 0.999

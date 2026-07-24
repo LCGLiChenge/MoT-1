@@ -109,7 +109,7 @@ torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_rout
   --config configs/h200_projectedconvnext_from_epoch5.yaml
 ```
 
-This uses `batch_size=32`, `accum_steps=1`, resumes from step 127360 and trains to `max_steps=152385` (about 5 more epochs on ImageNet). It resets optimizer and discriminator for the projected ConvNeXt branch, runs a 500-step D warmup via `d_warmup_steps=500`, keeps the 1D adapter frozen, effectively freezes Router with `lr_router=0`, trains the 2D tokenizer/decoder at low LR, uses EMA, updates `latest.pt` every epoch, and saves explicit step checkpoints listed in the yaml.
+This uses `batch_size=32`, `accum_steps=1`, resumes from step 127360 and trains to `max_steps=152385` (about 5 more epochs on ImageNet). It resets optimizer and discriminator for the projected ConvNeXt branch, runs a 200-step D warmup via `d_warmup_steps=200`, keeps the 1D adapter frozen, effectively freezes Router with `lr_router=0`, trains the 2D tokenizer/decoder at low LR, uses EMA, updates `latest.pt` every epoch, and saves explicit step checkpoints listed in the yaml.
 
 ## 8. Eval
 
