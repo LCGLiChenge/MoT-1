@@ -1,6 +1,6 @@
 # MoT-1 Current H200 Run
 
-This repo is a minimal handoff package for the current MoT experiment only. It resumes the projected ConvNeXt discriminator branch from `epoch_0005_step_00127360.pt` and trains on 8 H200 GPUs.
+This repo is a minimal handoff package for the current MoT experiment only. It continues the projected ConvNeXt discriminator branch from the previous H200 run `results/projectedconvnext_from_epoch5_h200_8gpu/latest.pt` and trains 5 more epochs on 8 H200 GPUs.
 
 ## 1. Clone
 
@@ -40,11 +40,11 @@ python download_public_weights.py \
 
 ## 4. MoT Checkpoints
 
-The H200 config expects these private checkpoints:
+The H200 continuation config expects these private checkpoints:
 
 ```text
 weights/step_00066000.pt
-weights/epoch_0005_step_00127360.pt
+results/projectedconvnext_from_epoch5_h200_8gpu/latest.pt
 ```
 
 If they are not already local, download them from the private Hugging Face checkpoint repo into this repo root. Example:
@@ -52,12 +52,15 @@ If they are not already local, download them from the private Hugging Face check
 ```bash
 HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 \
   weights/step_00066000.pt \
-  weights/epoch_0005_step_00127360.pt \
   --repo-type model \
   --local-dir .
+
+mkdir -p results/projectedconvnext_from_epoch5_h200_8gpu
+# Put the previous H200 `latest.pt` at:
+# results/projectedconvnext_from_epoch5_h200_8gpu/latest.pt
 ```
 
-If the checkpoint repo uses different filenames, keep the local paths above or update `adapter_init` and `resume` in `configs/h200_projectedconvnext_from_epoch5.yaml`.
+If the previous H200 checkpoint is stored under a different local path, update `resume` in `configs/h200_projectedconvnext_from_epoch5.yaml`.
 
 ## 5. Wandb
 
@@ -77,7 +80,7 @@ wandb logout
 
 ## 6. Smoke Test
 
-Use one GPU and a tiny subset. This checks imports, dataloader, checkpoint loading, D reset, and saving.
+Use one GPU and a tiny subset. This checks imports, dataloader, checkpoint loading, discriminator resume, and final saving.
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 \
@@ -87,7 +90,7 @@ torchrun --standalone --nproc_per_node=1 train_titok_llamagen_decoder_adapt_rout
   --accum-steps 1 \
   --limit-samples 8 \
   --num-workers 0 \
-  --max-steps 127361 \
+  --max-steps 152386 \
   --log-every 1 \
   --sample-every 0 \
   --sample-images 0 \
@@ -96,10 +99,10 @@ torchrun --standalone --nproc_per_node=1 train_titok_llamagen_decoder_adapt_rout
   --save-epoch-every 0 \
   --no-save-step-checkpoints \
   --no-wandb \
-  --output-dir results/smoke_projectedconvnext_from_epoch5
+  --output-dir results/smoke_projectedconvnext_from_h200_latest
 ```
 
-Delete only `results/smoke_projectedconvnext_from_epoch5` after the smoke test passes.
+Delete only `results/smoke_projectedconvnext_from_h200_latest` after the smoke test passes.
 
 ## 7. Train On 8 H200 GPUs
 
@@ -109,7 +112,7 @@ torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_rout
   --config configs/h200_projectedconvnext_from_epoch5.yaml
 ```
 
-This uses `batch_size=32`, `accum_steps=1`, resumes from step 127360 and trains to `max_steps=152385` (about 5 more epochs on ImageNet). It resets optimizer and discriminator for the projected ConvNeXt branch, runs a 200-step D warmup via `d_warmup_steps=200`, keeps the 1D adapter frozen, effectively freezes Router with `lr_router=0`, trains the 2D tokenizer/decoder at low LR, uses EMA, updates `latest.pt` every epoch, and saves explicit step checkpoints listed in the yaml.
+This uses `batch_size=32`, `accum_steps=1`, resumes from the previous H200 `latest.pt` at step 152385, and trains to `max_steps=177410` (about 5 more epochs on ImageNet). It resumes optimizer, discriminator, and EMA state, keeps the 1D adapter frozen, effectively freezes Router with `lr_router=0`, trains the 2D tokenizer/decoder at low LR, and saves only the final `latest.pt` at the end.
 
 ## 8. Eval
 
@@ -125,6 +128,6 @@ For a specific checkpoint:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
   --config configs/eval_projectedconvnext_50000.yaml \
-  --ckpt results/projectedconvnext_from_epoch5_h200_8gpu/step_00152385.pt \
-  --output-json results/projectedconvnext_from_epoch5_h200_8gpu/eval_step_00152385_50000.json
+  --ckpt results/projectedconvnext_from_h200_latest_5epoch/latest.pt \
+  --output-json results/projectedconvnext_from_h200_latest_5epoch/eval_latest_50000.json
 ```

@@ -1,12 +1,12 @@
 # 50k validation eval for current projected ConvNeXt branch.
 # Override ckpt/output_json on the CLI for a specific checkpoint if needed.
 
-ckpt: results/projectedconvnext_from_epoch5_h200_8gpu/latest.pt
+ckpt: results/projectedconvnext_from_h200_latest_5epoch/latest.pt
 adapter_init: weights/step_00066000.pt
 adapter_init_ema: true
 use_model_ema: true
 data_path: ../ImageNet/validation
-output_json: results/projectedconvnext_from_epoch5_h200_8gpu/eval_latest_50000.json
+output_json: results/projectedconvnext_from_h200_latest_5epoch/eval_latest_50000.json
 num_images: 50000
 batch_size: 64
 num_workers: 8

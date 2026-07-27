@@ -1,5 +1,21 @@
 # Experiment Notes
 
+## H200 Latest Continuation
+
+Goal:
+- Continue the previous H200 projected ConvNeXt run for 5 more epochs.
+- Resume from `results/projectedconvnext_from_epoch5_h200_8gpu/latest.pt` (expected step 152385).
+- Keep the same training objective and projected ConvNeXt discriminator setup.
+- Resume optimizer, discriminator, and EMA state; do not reset D for this continuation.
+- Train to `max_steps=177410`, about 5 more epochs with the current H200 batch setting.
+- Save no intermediate checkpoints; only the final `results/projectedconvnext_from_h200_latest_5epoch/latest.pt` is written at training end.
+
+Files updated for this handoff:
+- `configs/h200_projectedconvnext_from_epoch5.yaml`
+- `configs/eval_projectedconvnext_50000.yaml`
+- `README.md`
+
+
 ## Current H200 Handoff
 
 Goal:
