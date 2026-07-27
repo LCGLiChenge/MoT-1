@@ -33,7 +33,22 @@ Known local result before H200 migration:
 - 50k val EMA metrics:
   - step 136500: FID 2.51763, PSNR 20.92721, LPIPS 0.20577, tokens 133.63
   - step 137000: FID 2.51945, PSNR 20.93426, LPIPS 0.20546, tokens 133.64
-- Later local checkpoints 139000/141000/143000/145000 were produced, but this machine's CUDA driver/NVML broke before eval could run.
+- Later local checkpoints 139000/141000/143000/145000 were evaluated after the CUDA driver recovered.
+- 50k val EMA metrics, mix-only:
+  - step 139000: FID 2.43991, PSNR 20.93324, LPIPS 0.20579, tokens 133.61
+  - step 141000: FID 2.41792, PSNR 20.96448, LPIPS 0.20544, tokens 133.62
+  - step 143000: FID 2.38564, PSNR 20.97675, LPIPS 0.20549, tokens 133.61
+  - step 145000: FID 2.39550, PSNR 20.98483, LPIPS 0.20527, tokens 133.59
+- Current best measured FID in this local continuation is step 143000; step 145000 has slightly better PSNR but a small FID rebound.
+
+H200/Hugging Face eval result:
+- Source checkpoint: `sophiaa/MoT-1-checkpoints`, file `weights/latest.pt`.
+- Local eval file: `/tmp/mot_hf_latest_eval/weights/latest.pt`.
+- Eval recognized `ckpt_step=152385`.
+- Eval data path: `/home/heyefei/ImageNet/validation`.
+- Eval setting: 50k validation images, mix-only, `mask_selection=router_e2e_dynamic`, `score_normalize_scope=per_image`, `use_model_ema=false`.
+- Result: FID 2.23795, PSNR 21.01783, LPIPS 0.20518, L1 0.12797, SSIM 0.53135, tokens 133.49.
+- This is the best measured FID so far in the projected ConvNeXt branch, and it also improves PSNR over the local 143000/145000 checkpoints.
 
 Operational notes:
 - Training should be launched by the user or collaborator, not automatically by Codex.
