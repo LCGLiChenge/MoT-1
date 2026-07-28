@@ -1,6 +1,6 @@
 # MoT-1 Current H200 Run
 
-This repo is a minimal handoff package for the current MoT experiment only. It continues the projected ConvNeXt discriminator branch from the previous H200 run `results/projectedconvnext_from_epoch5_h200_8gpu/latest.pt` and trains 5 more epochs on 8 H200 GPUs.
+This repo is a minimal handoff package for the current MoT experiment only. It continues the projected ConvNeXt discriminator branch from the previous H200 run `results/projectedconvnext_from_epoch5_h200_8gpu/latest.pt` and trains 10 more epochs on 8 H200 GPUs.
 
 ## 1. Clone
 
@@ -112,7 +112,7 @@ torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_rout
   --config configs/h200_projectedconvnext_from_epoch5.yaml
 ```
 
-This uses `batch_size=32`, `accum_steps=1`, resumes from the previous H200 `latest.pt` at step 152385, and trains to `max_steps=177410` (about 5 more epochs on ImageNet). It resumes optimizer, discriminator, and EMA state, keeps the 1D adapter frozen, effectively freezes Router with `lr_router=0`, trains the 2D tokenizer/decoder at low LR, and saves only the final `latest.pt` at the end.
+This uses `batch_size=32`, `accum_steps=1`, resumes from the previous H200 `latest.pt` at step 152385, and trains to `max_steps=202435` (about 10 more epochs on ImageNet). It resumes optimizer, discriminator, and EMA state, keeps the 1D adapter frozen, effectively freezes Router with `lr_router=0`, trains the 2D tokenizer/decoder at low LR, and saves `step_00177410.pt` at epoch 5 and the final `latest.pt` at epoch 10.
 
 ## 8. Eval
 
@@ -128,6 +128,6 @@ For a specific checkpoint:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
   --config configs/eval_projectedconvnext_50000.yaml \
-  --ckpt results/projectedconvnext_from_h200_latest_5epoch/latest.pt \
-  --output-json results/projectedconvnext_from_h200_latest_5epoch/eval_latest_50000.json
+  --ckpt results/projectedconvnext_from_h200_latest_10epoch/latest.pt \
+  --output-json results/projectedconvnext_from_h200_latest_10epoch/eval_latest_50000.json
 ```

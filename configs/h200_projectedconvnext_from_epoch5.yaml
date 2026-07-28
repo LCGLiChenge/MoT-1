@@ -1,8 +1,8 @@
-# Current H200 run: continue the H200 projected ConvNeXt discriminator branch from its latest.pt for 5 more epochs.
+# Current H200 run: continue the H200 projected ConvNeXt discriminator branch from its latest.pt for 10 more epochs.
 # Paths are relative to this repository root.
 
 data_path: ../ImageNet/train
-output_dir: results/projectedconvnext_from_h200_latest_5epoch
+output_dir: results/projectedconvnext_from_h200_latest_10epoch
 
 adapter_init: weights/step_00066000.pt
 adapter_init_ema: true
@@ -19,7 +19,7 @@ random_crop: false
 random_flip: false
 batch_size: 32
 accum_steps: 1
-max_steps: 177410
+max_steps: 202435
 num_workers: 12
 limit_samples: 0
 
@@ -132,14 +132,14 @@ save_every: 0
 latest_every_epoch: false
 save_epoch_every: 0
 save_step_checkpoints: false
-save_steps: []
+save_steps: [177410]
 
 wandb: true
 wandb_project: MoT
-wandb_name: mot_h200_projectedconvnext_from_h200_latest_5epoch
+wandb_name: mot_h200_projectedconvnext_from_h200_latest_10epoch
 wandb_entity: ""
 wandb_mode: ""
-wandb_tags: [h200, 8gpu, projectedconvnextD, gan010, mix2, from_h200_latest, final_only]
+wandb_tags: [h200, 8gpu, projectedconvnextD, gan010, mix2, from_h200_latest, 10epoch, save_epoch5_latest]
 
 lg_latent_channels: 256
 lg_head_channels: 256
