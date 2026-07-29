@@ -1439,7 +1439,7 @@ def main(args):
                 "phase": "g_freeze" if g_freeze_active else ("router" if router_only_active else "joint"),
             })
 
-        if is_main and (step == 1 or step % args.log_every == 0):
+        if is_main and (step == start_step + 1 or step % args.log_every == 0):
             with torch.no_grad():
                 f_1d_lg = last["f_1d_lg"]
                 f_2d_lg = last["f_2d_lg"]

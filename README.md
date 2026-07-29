@@ -71,7 +71,7 @@ read -rsp "WANDB_API_KEY: " WANDB_API_KEY; echo
 export WANDB_API_KEY
 ```
 
-Training should print a wandb run URL. To disable wandb for a smoke test, pass `--no-wandb`. After training, clear the key:
+Training should print a wandb run URL. After resuming, `train/*` metrics should appear after the first completed optimizer step. If the run shows only system curves and then fails, check the terminal/log for a crash before the first optimizer step. To disable wandb for a smoke test, pass `--no-wandb`. After training, clear the key:
 
 ```bash
 unset WANDB_API_KEY
