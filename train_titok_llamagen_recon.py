@@ -362,15 +362,20 @@ class DINOFeatureDiscriminator(nn.Module):
 
 
 class ProjectedPatchHead(nn.Module):
-    def __init__(self, in_channels, hidden_channels=256):
+    def __init__(self, in_channels, hidden_channels=256, depth=2):
         super().__init__()
-        self.net = nn.Sequential(
+        depth = max(int(depth), 1)
+        layers = [
             nn.utils.spectral_norm(nn.Conv2d(in_channels, hidden_channels, 1)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.utils.spectral_norm(nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1)),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.utils.spectral_norm(nn.Conv2d(hidden_channels, 1, 1)),
-        )
+        ]
+        for _ in range(depth - 1):
+            layers.extend([
+                nn.utils.spectral_norm(nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1)),
+                nn.LeakyReLU(0.2, inplace=True),
+            ])
+        layers.append(nn.utils.spectral_norm(nn.Conv2d(hidden_channels, 1, 1)))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x.float())
@@ -393,36 +398,55 @@ class ProjectedConvNeXtDiscriminator(nn.Module):
         self,
         input_size=224,
         hidden_channels=256,
+        backbone_name="convnext_small",
         feature_nodes=None,
         loss_weights=None,
+        head_depth=2,
         pretrained=True,
     ):
         super().__init__()
         self.input_size = int(input_size)
-        self.feature_nodes = tuple(feature_nodes or [
-            "features.1.2.add",
-            "features.3.2.add",
-            "features.5.26.add",
-            "features.7.2.add",
-        ])
-        channels_by_node = {
-            "features.1.2.add": 96,
-            "features.3.2.add": 192,
-            "features.5.26.add": 384,
-            "features.7.2.add": 768,
-        }
+        self.backbone_name = str(backbone_name)
+        self.feature_nodes = tuple(
+            feature_nodes
+            or [
+                "features.1.2.add",
+                "features.3.2.add",
+                "features.5.26.add",
+                "features.7.2.add",
+            ]
+        )
+        if self.backbone_name == "convnext_small":
+            channels_by_node = {
+                "features.1.2.add": 96,
+                "features.3.2.add": 192,
+                "features.5.26.add": 384,
+                "features.7.2.add": 768,
+            }
+            weights = models.ConvNeXt_Small_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = models.convnext_small(weights=weights)
+        elif self.backbone_name == "convnext_base":
+            channels_by_node = {
+                "features.1.2.add": 128,
+                "features.3.2.add": 256,
+                "features.5.26.add": 512,
+                "features.7.2.add": 1024,
+            }
+            weights = models.ConvNeXt_Base_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = models.convnext_base(weights=weights)
+        else:
+            raise ValueError(f"unsupported projected ConvNeXt backbone {backbone_name}")
         missing = [node for node in self.feature_nodes if node not in channels_by_node]
         if missing:
-            raise ValueError(f"unsupported projected ConvNeXt feature nodes: {missing}")
-        weights = models.ConvNeXt_Small_Weights.IMAGENET1K_V1 if pretrained else None
-        backbone = models.convnext_small(weights=weights).eval().requires_grad_(False)
+            raise ValueError(f"unsupported projected ConvNeXt feature nodes for {self.backbone_name}: {missing}")
+        backbone = backbone.eval().requires_grad_(False)
         return_nodes = {node: f"feat_{idx}" for idx, node in enumerate(self.feature_nodes)}
         self.backbone_proxy = (create_feature_extractor(backbone, return_nodes=return_nodes).eval().requires_grad_(False),)
         self.loss_weights = tuple(parse_float_sequence(loss_weights, [1.0] * len(self.feature_nodes)))
         if len(self.loss_weights) != len(self.feature_nodes):
             raise ValueError(f"projected loss weights length mismatch: {self.loss_weights} vs {self.feature_nodes}")
         self.heads = nn.ModuleList(
-            ProjectedPatchHead(channels_by_node[node], hidden_channels=hidden_channels)
+            ProjectedPatchHead(channels_by_node[node], hidden_channels=hidden_channels, depth=head_depth)
             for node in self.feature_nodes
         )
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None])
@@ -444,6 +468,479 @@ class ProjectedConvNeXtDiscriminator(nn.Module):
             x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
         x = (x - self.imagenet_mean) / self.imagenet_std
         return list(self.backbone_proxy[0](x).values())
+
+    def forward(self, x_01):
+        features = self._extract(x_01)
+        return [(head(feat), weight) for head, feat, weight in zip(self.heads, features, self.loss_weights)]
+
+    def discriminator_features(self, x_01):
+        features = self._extract(x_01)
+        outputs = []
+        for head, feat, weight in zip(self.heads, features, self.loss_weights):
+            outputs.extend((item, weight) for item in head.features(feat))
+        return outputs
+
+
+def official_pg_conv2d(*args, **kwargs):
+    return nn.utils.spectral_norm(nn.Conv2d(*args, **kwargs))
+
+
+def official_pg_norm_layer(channels, mode="batch"):
+    if mode == "group":
+        return nn.GroupNorm(max(int(channels) // 2, 1), int(channels))
+    if mode == "batch":
+        return nn.BatchNorm2d(int(channels))
+    raise ValueError(f"unsupported official Projected GAN norm mode {mode}")
+
+
+class OfficialPGDownBlock(nn.Module):
+    # Adapted from autonomousvision/projected_gan pg_modules.blocks.DownBlock.
+    def __init__(self, in_planes, out_planes, separable=False):
+        super().__init__()
+        if separable:
+            self.main = nn.Sequential(
+                official_pg_conv2d(in_planes, in_planes, 3, groups=in_planes, bias=False, padding=1),
+                official_pg_conv2d(in_planes, out_planes, 1, bias=False),
+                official_pg_norm_layer(out_planes),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.AvgPool2d(2, 2),
+            )
+        else:
+            self.main = nn.Sequential(
+                official_pg_conv2d(in_planes, out_planes, 4, 2, 1),
+                official_pg_norm_layer(out_planes),
+                nn.LeakyReLU(0.2, inplace=True),
+            )
+
+    def forward(self, feat):
+        return self.main(feat)
+
+
+class OfficialPGDownBlockPatch(nn.Module):
+    # Adapted from autonomousvision/projected_gan pg_modules.blocks.DownBlockPatch.
+    def __init__(self, in_planes, out_planes, separable=False):
+        super().__init__()
+        self.main = nn.Sequential(
+            OfficialPGDownBlock(in_planes, out_planes, separable=separable),
+            official_pg_conv2d(out_planes, out_planes, 1, 1, 0, bias=False),
+            official_pg_norm_layer(out_planes),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+    def forward(self, feat):
+        return self.main(feat)
+
+
+class OfficialPGFeatureFusionBlock(nn.Module):
+    # Adapted from autonomousvision/projected_gan pg_modules.blocks.FeatureFusionBlock.
+    def __init__(self, features, expand=False, align_corners=True):
+        super().__init__()
+        out_features = int(features) // 2 if expand else int(features)
+        self.expand = bool(expand)
+        self.align_corners = bool(align_corners)
+        self.out_conv = nn.Conv2d(int(features), out_features, kernel_size=1, stride=1, padding=0, bias=True, groups=1)
+
+    def forward(self, *xs):
+        output = xs[0]
+        if len(xs) == 2:
+            output = output + xs[1]
+        output = F.interpolate(output, scale_factor=2, mode="bilinear", align_corners=self.align_corners)
+        return self.out_conv(output)
+
+
+class OfficialPGSingleDisc(nn.Module):
+    # Adapted from autonomousvision/projected_gan pg_modules.discriminator.SingleDisc.
+    def __init__(self, nc=None, ndf=None, start_sz=256, end_sz=8, head=False, separable=False, patch=False):
+        super().__init__()
+        channel_dict = {4: 512, 8: 512, 16: 256, 32: 128, 64: 64, 128: 64, 256: 32, 512: 16, 1024: 8}
+        if start_sz not in channel_dict:
+            start_sz = min(channel_dict.keys(), key=lambda size: abs(size - int(start_sz)))
+        start_sz = int(start_sz)
+        if ndf is None:
+            nfc = dict(channel_dict)
+        else:
+            nfc = {key: int(ndf) for key in channel_dict}
+        if nc is not None and not head:
+            nfc[start_sz] = int(nc)
+        layers = []
+        if head:
+            layers.extend([
+                official_pg_conv2d(int(nc), nfc[256], 3, 1, 1, bias=False),
+                nn.LeakyReLU(0.2, inplace=True),
+            ])
+        block_cls = OfficialPGDownBlockPatch if patch else OfficialPGDownBlock
+        while start_sz > end_sz:
+            layers.append(block_cls(nfc[start_sz], nfc[start_sz // 2], separable=separable))
+            start_sz //= 2
+        layers.append(official_pg_conv2d(nfc[end_sz], 1, 4, 1, 0, bias=False))
+        self.main = nn.Sequential(*layers)
+
+    def forward(self, x, c=None):
+        return self.main(x)
+
+    def features(self, x):
+        h = x
+        outputs = []
+        for layer in self.main[:-1]:
+            h = layer(h)
+            outputs.append(h)
+        outputs.append(self.main[-1](h))
+        return outputs
+
+
+class OfficialPGMultiScaleD(nn.Module):
+    # Adapted from autonomousvision/projected_gan pg_modules.discriminator.MultiScaleD.
+    def __init__(self, channels, resolutions, num_discs=4, ndf=None, separable=False, patch=False):
+        super().__init__()
+        num_discs = int(num_discs)
+        if num_discs not in {1, 2, 3, 4}:
+            raise ValueError(f"official Projected GAN num_discs must be 1..4, got {num_discs}")
+        self.disc_in_channels = list(channels)[:num_discs]
+        self.disc_in_res = list(resolutions)[:num_discs]
+        self.mini_discs = nn.ModuleDict()
+        for index, (cin, res) in enumerate(zip(self.disc_in_channels, self.disc_in_res)):
+            start_sz = 16 if patch else int(res)
+            self.mini_discs[str(index)] = OfficialPGSingleDisc(
+                nc=int(cin),
+                ndf=ndf,
+                start_sz=start_sz,
+                end_sz=8,
+                separable=separable,
+                patch=patch,
+            )
+
+    def forward(self, features, c=None):
+        logits = []
+        for key, disc in self.mini_discs.items():
+            logits.append(disc(features[key], c).view(features[key].size(0), -1))
+        return torch.cat(logits, dim=1)
+
+    def features(self, features):
+        outputs = []
+        for key, disc in self.mini_discs.items():
+            outputs.extend(disc.features(features[key]))
+        return outputs
+
+
+class OfficialPGFeatureNetwork(nn.Module):
+    # Adapted from autonomousvision/projected_gan pg_modules.projector.F_RandomProj.
+    def __init__(self, im_res=256, cout=64, expand=True, proj_type=2, pretrained=True):
+        super().__init__()
+        if proj_type not in {0, 1, 2}:
+            raise ValueError(f"official Projected GAN proj_type must be 0, 1, or 2, got {proj_type}")
+        import timm
+
+        model = timm.create_model("tf_efficientnet_lite0", pretrained=bool(pretrained))
+        stem_layers = [model.conv_stem, model.bn1]
+        if hasattr(model, "act1"):
+            stem_layers.append(model.act1)
+        pretrained_layers = nn.Module()
+        pretrained_layers.layer0 = nn.Sequential(*stem_layers, *model.blocks[0:2])
+        pretrained_layers.layer1 = nn.Sequential(*model.blocks[2:3])
+        pretrained_layers.layer2 = nn.Sequential(*model.blocks[3:5])
+        pretrained_layers.layer3 = nn.Sequential(*model.blocks[5:9])
+        pretrained_layers.eval().requires_grad_(False)
+        self.pretrained_proxy = (pretrained_layers,)
+        self.proj_type = int(proj_type)
+        self.cout = int(cout)
+        self.expand = bool(expand)
+        self.RESOLUTIONS = [int(im_res) // 4, int(im_res) // 8, int(im_res) // 16, int(im_res) // 32]
+        in_channels = self._calc_channels(int(im_res))
+        if self.proj_type == 0:
+            self.CHANNELS = in_channels
+            self.scratch = None
+            return
+        scratch = nn.Module()
+        out_channels = [self.cout, self.cout * 2, self.cout * 4, self.cout * 8] if self.expand else [self.cout] * 4
+        scratch.layer0_ccm = nn.Conv2d(in_channels[0], out_channels[0], kernel_size=1, stride=1, padding=0, bias=True)
+        scratch.layer1_ccm = nn.Conv2d(in_channels[1], out_channels[1], kernel_size=1, stride=1, padding=0, bias=True)
+        scratch.layer2_ccm = nn.Conv2d(in_channels[2], out_channels[2], kernel_size=1, stride=1, padding=0, bias=True)
+        scratch.layer3_ccm = nn.Conv2d(in_channels[3], out_channels[3], kernel_size=1, stride=1, padding=0, bias=True)
+        if self.proj_type == 1:
+            self.CHANNELS = out_channels
+            self.scratch = scratch
+            return
+        scratch.layer3_csm = OfficialPGFeatureFusionBlock(out_channels[3], expand=self.expand)
+        scratch.layer2_csm = OfficialPGFeatureFusionBlock(out_channels[2], expand=self.expand)
+        scratch.layer1_csm = OfficialPGFeatureFusionBlock(out_channels[1], expand=self.expand)
+        scratch.layer0_csm = OfficialPGFeatureFusionBlock(out_channels[0], expand=False)
+        self.CHANNELS = [self.cout, self.cout, self.cout * 2, self.cout * 4] if self.expand else [self.cout] * 4
+        self.RESOLUTIONS = [res * 2 for res in self.RESOLUTIONS]
+        self.scratch = scratch
+
+    def _apply(self, fn, *args, **kwargs):
+        super()._apply(fn, *args, **kwargs)
+        self.pretrained_proxy[0]._apply(fn, *args, **kwargs)
+        return self
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.pretrained_proxy[0].eval()
+        return self
+
+    def _calc_channels(self, im_res):
+        device = next(self.pretrained_proxy[0].parameters()).device
+        with torch.no_grad():
+            tmp = torch.zeros(1, 3, im_res, im_res, device=device)
+            channels = []
+            for layer_name in ["layer0", "layer1", "layer2", "layer3"]:
+                tmp = getattr(self.pretrained_proxy[0], layer_name)(tmp)
+                channels.append(tmp.shape[1])
+        return channels
+
+    def forward(self, x):
+        out0 = self.pretrained_proxy[0].layer0(x)
+        out1 = self.pretrained_proxy[0].layer1(out0)
+        out2 = self.pretrained_proxy[0].layer2(out1)
+        out3 = self.pretrained_proxy[0].layer3(out2)
+        out = {"0": out0, "1": out1, "2": out2, "3": out3}
+        if self.proj_type == 0:
+            return out
+        out0 = self.scratch.layer0_ccm(out["0"])
+        out1 = self.scratch.layer1_ccm(out["1"])
+        out2 = self.scratch.layer2_ccm(out["2"])
+        out3 = self.scratch.layer3_ccm(out["3"])
+        out = {"0": out0, "1": out1, "2": out2, "3": out3}
+        if self.proj_type == 1:
+            return out
+        out3 = self.scratch.layer3_csm(out3)
+        out2 = self.scratch.layer2_csm(out3, out2)
+        out1 = self.scratch.layer1_csm(out2, out1)
+        out0 = self.scratch.layer0_csm(out1, out0)
+        return {"0": out0, "1": out1, "2": out2, "3": out3}
+
+
+class OfficialPGDiffAugment(nn.Module):
+    # Adapted from autonomousvision/projected_gan pg_modules.diffaug.
+    def __init__(self, policy="color,translation,cutout"):
+        super().__init__()
+        self.policy = str(policy or "")
+
+    def forward(self, x):
+        if not self.policy:
+            return x
+        for policy in self.policy.split(','):
+            policy = policy.strip()
+            if not policy:
+                continue
+            if policy == "color":
+                x = self.rand_brightness(x)
+                x = self.rand_saturation(x)
+                x = self.rand_contrast(x)
+            elif policy == "translation":
+                x = self.rand_translation(x)
+            elif policy == "cutout":
+                x = self.rand_cutout(x)
+            else:
+                raise ValueError(f"unsupported official Projected GAN diffaug policy {policy}")
+        return x.contiguous()
+
+    @staticmethod
+    def rand_brightness(x):
+        return x + (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) - 0.5)
+
+    @staticmethod
+    def rand_saturation(x):
+        x_mean = x.mean(dim=1, keepdim=True)
+        return (x - x_mean) * (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) * 2) + x_mean
+
+    @staticmethod
+    def rand_contrast(x):
+        x_mean = x.mean(dim=[1, 2, 3], keepdim=True)
+        return (x - x_mean) * (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) + 0.5) + x_mean
+
+    @staticmethod
+    def rand_translation(x, ratio=0.125):
+        shift_x, shift_y = int(x.size(2) * ratio + 0.5), int(x.size(3) * ratio + 0.5)
+        translation_x = torch.randint(-shift_x, shift_x + 1, size=[x.size(0), 1, 1], device=x.device)
+        translation_y = torch.randint(-shift_y, shift_y + 1, size=[x.size(0), 1, 1], device=x.device)
+        grid_batch, grid_x, grid_y = torch.meshgrid(
+            torch.arange(x.size(0), dtype=torch.long, device=x.device),
+            torch.arange(x.size(2), dtype=torch.long, device=x.device),
+            torch.arange(x.size(3), dtype=torch.long, device=x.device),
+            indexing="ij",
+        )
+        grid_x = torch.clamp(grid_x + translation_x + 1, 0, x.size(2) + 1)
+        grid_y = torch.clamp(grid_y + translation_y + 1, 0, x.size(3) + 1)
+        x_pad = F.pad(x, [1, 1, 1, 1, 0, 0, 0, 0])
+        return x_pad.permute(0, 2, 3, 1).contiguous()[grid_batch, grid_x, grid_y].permute(0, 3, 1, 2)
+
+    @staticmethod
+    def rand_cutout(x, ratio=0.2):
+        cutout_size = int(x.size(2) * ratio + 0.5), int(x.size(3) * ratio + 0.5)
+        offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
+        grid_batch, grid_x, grid_y = torch.meshgrid(
+            torch.arange(x.size(0), dtype=torch.long, device=x.device),
+            torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
+            torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
+            indexing="ij",
+        )
+        grid_x = torch.clamp(grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1)
+        grid_y = torch.clamp(grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1)
+        mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+        mask[grid_batch, grid_x, grid_y] = 0
+        return x * mask.unsqueeze(1)
+
+
+class OfficialProjectedGANDiscriminator(nn.Module):
+    # Adapted from autonomousvision/projected_gan pg_modules.discriminator.ProjectedDiscriminator.
+    # The pretrained EfficientNet feature extractor is frozen; CCM/CSM and MultiScaleD are trainable.
+    def __init__(
+        self,
+        input_size=224,
+        im_res=256,
+        cout=64,
+        expand=True,
+        proj_type=2,
+        num_discs=4,
+        separable=False,
+        patch=False,
+        pretrained=True,
+        diffaug=True,
+        diffaug_policy="color,translation,cutout",
+    ):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.diffaug = OfficialPGDiffAugment(diffaug_policy) if diffaug else None
+        self.feature_network = OfficialPGFeatureNetwork(
+            im_res=int(im_res),
+            cout=int(cout),
+            expand=bool(expand),
+            proj_type=int(proj_type),
+            pretrained=bool(pretrained),
+        )
+        self.discriminator = OfficialPGMultiScaleD(
+            channels=self.feature_network.CHANNELS,
+            resolutions=self.feature_network.RESOLUTIONS,
+            num_discs=int(num_discs),
+            separable=bool(separable),
+            patch=bool(patch),
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.feature_network.train(False)
+        return self
+
+    def _prepare(self, x_01):
+        x = x_01.float()
+        if self.diffaug is not None:
+            x = self.diffaug(x)
+        if x.shape[-2:] != (self.input_size, self.input_size):
+            x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False)
+        return x
+
+    def forward(self, x_01):
+        x = self._prepare(x_01)
+        features = self.feature_network(x)
+        return self.discriminator(features, None)
+
+    def discriminator_features(self, x_01):
+        x = self._prepare(x_01)
+        features = self.feature_network(x)
+        return [(feature, 1.0) for feature in self.discriminator.features(features)]
+
+
+class FrozenChannelProjection(nn.Module):
+    def __init__(self, in_channels, out_channels, normalize_input=True):
+        super().__init__()
+        self.normalize_input = bool(normalize_input)
+        weight = torch.randn(int(out_channels), int(in_channels), 1, 1)
+        weight = weight / math.sqrt(max(int(in_channels), 1))
+        self.register_buffer("weight", weight)
+
+    def forward(self, x):
+        h = x.float()
+        if self.normalize_input:
+            h = F.normalize(h, dim=1)
+        return F.conv2d(h, self.weight)
+
+
+class ProjectedGANDiscriminator(nn.Module):
+    # Closer to projected-GAN: frozen pretrained feature network, fixed random
+    # channel projections, and trainable patch heads at multiple feature levels.
+    def __init__(
+        self,
+        input_size=224,
+        backbone_name="convnext_small",
+        project_channels=256,
+        hidden_channels=256,
+        feature_nodes=None,
+        loss_weights=None,
+        head_depth=2,
+        normalize_features=True,
+        pretrained=True,
+    ):
+        super().__init__()
+        self.input_size = int(input_size)
+        self.backbone_name = str(backbone_name)
+        self.feature_nodes = tuple(feature_nodes or [
+            "features.1.2.add",
+            "features.3.2.add",
+            "features.5.26.add",
+            "features.7.2.add",
+        ])
+        if self.backbone_name == "convnext_small":
+            channels_by_node = {
+                "features.1.2.add": 96,
+                "features.3.2.add": 192,
+                "features.5.26.add": 384,
+                "features.7.2.add": 768,
+            }
+            weights = models.ConvNeXt_Small_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = models.convnext_small(weights=weights)
+        elif self.backbone_name == "convnext_base":
+            channels_by_node = {
+                "features.1.2.add": 128,
+                "features.3.2.add": 256,
+                "features.5.26.add": 512,
+                "features.7.2.add": 1024,
+            }
+            weights = models.ConvNeXt_Base_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = models.convnext_base(weights=weights)
+        else:
+            raise ValueError(f"unsupported projected GAN backbone {backbone_name}")
+        missing = [node for node in self.feature_nodes if node not in channels_by_node]
+        if missing:
+            raise ValueError(f"unsupported projected GAN feature nodes for {self.backbone_name}: {missing}")
+        return_nodes = {node: f"feat_{idx}" for idx, node in enumerate(self.feature_nodes)}
+        self.backbone_proxy = (create_feature_extractor(backbone.eval().requires_grad_(False), return_nodes=return_nodes).eval().requires_grad_(False),)
+        self.loss_weights = tuple(parse_float_sequence(loss_weights, [1.0] * len(self.feature_nodes)))
+        if len(self.loss_weights) != len(self.feature_nodes):
+            raise ValueError(f"projected GAN loss weights length mismatch: {self.loss_weights} vs {self.feature_nodes}")
+        self.projections = nn.ModuleList(
+            FrozenChannelProjection(
+                channels_by_node[node],
+                project_channels,
+                normalize_input=normalize_features,
+            )
+            for node in self.feature_nodes
+        )
+        self.heads = nn.ModuleList(
+            ProjectedPatchHead(project_channels, hidden_channels=hidden_channels, depth=head_depth)
+            for _node in self.feature_nodes
+        )
+        self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None])
+        self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None])
+
+    def _apply(self, fn, *args, **kwargs):
+        super()._apply(fn, *args, **kwargs)
+        self.backbone_proxy[0]._apply(fn, *args, **kwargs)
+        return self
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone_proxy[0].eval()
+        return self
+
+    def _extract(self, x_01):
+        x = x_01.float()
+        if x.shape[-2:] != (self.input_size, self.input_size):
+            x = F.interpolate(x, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False, antialias=True)
+        x = (x - self.imagenet_mean) / self.imagenet_std
+        features = list(self.backbone_proxy[0](x).values())
+        return [projection(feature) for projection, feature in zip(self.projections, features)]
 
     def forward(self, x_01):
         features = self._extract(x_01)
@@ -534,6 +1031,104 @@ def build_dino_feature_loss(args, device):
         use_patch_tokens=getattr(args, "dino_feat_use_patch_tokens", True),
         loss_type=getattr(args, "dino_feat_loss", "l1"),
         normalize_features=getattr(args, "dino_feat_normalize", True),
+    ).to(device)
+    loss.eval().requires_grad_(False)
+    return loss
+
+
+class FrozenCLIPImageFeatureLoss(nn.Module):
+    def __init__(
+        self,
+        model_name="ViT-B-32",
+        pretrained="openai",
+        cache_dir=None,
+        prefer_hf_hub=True,
+        weights_only=True,
+        input_size=None,
+        loss_type="l1",
+        normalize_features=True,
+    ):
+        super().__init__()
+        self.loss_type = str(loss_type)
+        self.normalize_features = bool(normalize_features)
+        if self.loss_type not in {"l1", "l2"}:
+            raise ValueError(f"unsupported CLIP feature loss_type {loss_type}")
+        import open_clip
+
+        kwargs = {}
+        if cache_dir:
+            kwargs["cache_dir"] = cache_dir
+        kwargs["weights_only"] = bool(weights_only)
+        pretrained_arg = pretrained
+        if pretrained and not prefer_hf_hub:
+            pretrained_cfg = open_clip.get_pretrained_cfg(model_name, pretrained)
+            if pretrained_cfg is None:
+                raise ValueError(f"unknown open_clip pretrained tag {model_name}/{pretrained}")
+            pretrained_arg = open_clip.pretrained.download_pretrained(
+                pretrained_cfg,
+                prefer_hf_hub=False,
+                cache_dir=cache_dir,
+            )
+        model, _preprocess_train, _preprocess_val = open_clip.create_model_and_transforms(
+            model_name,
+            pretrained=pretrained_arg,
+            **kwargs,
+        )
+        model.eval().requires_grad_(False)
+        self.clip_proxy = (model,)
+        preprocess_cfg = getattr(model.visual, "preprocess_cfg", {}) or {}
+        image_size = input_size or preprocess_cfg.get("size", getattr(model.visual, "image_size", 224))
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
+        if isinstance(image_size, (tuple, list)) and len(image_size) == 1:
+            image_size = (int(image_size[0]), int(image_size[0]))
+        self.input_size = (int(image_size[0]), int(image_size[1]))
+        mean = preprocess_cfg.get("mean", (0.48145466, 0.4578275, 0.40821073))
+        std = preprocess_cfg.get("std", (0.26862954, 0.26130258, 0.27577711))
+        self.register_buffer("clip_mean", torch.tensor(mean)[None, :, None, None])
+        self.register_buffer("clip_std", torch.tensor(std)[None, :, None, None])
+
+    def _apply(self, fn, *args, **kwargs):
+        super()._apply(fn, *args, **kwargs)
+        self.clip_proxy[0]._apply(fn, *args, **kwargs)
+        return self
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.clip_proxy[0].eval()
+        return self
+
+    def extract_features(self, x_01):
+        x = x_01.float()
+        if x.shape[-2:] != self.input_size:
+            x = F.interpolate(x, size=self.input_size, mode="bicubic", align_corners=False, antialias=True)
+        x = (x - self.clip_mean) / self.clip_std
+        features = self.clip_proxy[0].encode_image(x, normalize=self.normalize_features)
+        return features.float()
+
+    def forward(self, pred, target, pred_range="minus1_1", target_range="minus1_1"):
+        pred_01 = image_to_zero_one(pred, pred_range)
+        target_01 = image_to_zero_one(target, target_range)
+        pred_features = self.extract_features(pred_01)
+        with torch.no_grad():
+            target_features = self.extract_features(target_01)
+        if self.loss_type == "l1":
+            return F.l1_loss(pred_features, target_features)
+        return F.mse_loss(pred_features, target_features)
+
+
+def build_clip_feature_loss(args, device):
+    if getattr(args, "lambda_clip_feat", 0.0) <= 0.0:
+        return None
+    loss = FrozenCLIPImageFeatureLoss(
+        model_name=getattr(args, "clip_model", "ViT-B-32"),
+        pretrained=getattr(args, "clip_pretrained", "openai"),
+        cache_dir=getattr(args, "clip_cache_dir", None),
+        prefer_hf_hub=getattr(args, "clip_prefer_hf_hub", True),
+        weights_only=getattr(args, "clip_weights_only", True),
+        input_size=getattr(args, "clip_feat_input_size", None),
+        loss_type=getattr(args, "clip_feat_loss", "l1"),
+        normalize_features=getattr(args, "clip_feat_normalize", True),
     ).to(device)
     loss.eval().requires_grad_(False)
     return loss
@@ -660,8 +1255,35 @@ def build_discriminator(args, device):
         discriminator = ProjectedConvNeXtDiscriminator(
             input_size=getattr(args, "projected_input_size", 224),
             hidden_channels=getattr(args, "projected_head_hidden", 256),
+            backbone_name=getattr(args, "projected_backbone", "convnext_small"),
+            head_depth=getattr(args, "projected_head_depth", 2),
             loss_weights=getattr(args, "projected_loss_weights", [1.0, 1.0, 1.0, 1.0]),
             pretrained=getattr(args, "projected_pretrained", True),
+        ).to(device)
+    elif discriminator_type == "projected_gan":
+        discriminator = ProjectedGANDiscriminator(
+            input_size=getattr(args, "projected_input_size", 224),
+            backbone_name=getattr(args, "projected_backbone", "convnext_small"),
+            project_channels=getattr(args, "projected_channels", 256),
+            hidden_channels=getattr(args, "projected_head_hidden", 256),
+            head_depth=getattr(args, "projected_head_depth", 2),
+            loss_weights=getattr(args, "projected_loss_weights", [1.0, 1.0, 1.0, 1.0]),
+            normalize_features=getattr(args, "projected_normalize_features", True),
+            pretrained=getattr(args, "projected_pretrained", True),
+        ).to(device)
+    elif discriminator_type == "official_projected_gan":
+        discriminator = OfficialProjectedGANDiscriminator(
+            input_size=getattr(args, "official_pg_input_size", getattr(args, "projected_input_size", 224)),
+            im_res=getattr(args, "official_pg_im_res", getattr(args, "image_size", 256)),
+            cout=getattr(args, "official_pg_cout", 64),
+            expand=getattr(args, "official_pg_expand", True),
+            proj_type=getattr(args, "official_pg_proj_type", 2),
+            num_discs=getattr(args, "official_pg_num_discs", 4),
+            separable=getattr(args, "official_pg_separable", False),
+            patch=getattr(args, "official_pg_patch", False),
+            pretrained=getattr(args, "official_pg_pretrained", True),
+            diffaug=getattr(args, "official_pg_diffaug", True),
+            diffaug_policy=getattr(args, "official_pg_diffaug_policy", "color,translation,cutout"),
         ).to(device)
     elif discriminator_type == "stylegan":
         discriminator = StyleGANDiscriminator(
@@ -767,7 +1389,7 @@ def _weighted_discriminator_features(discriminator, x):
         return outputs
     if isinstance(discriminator, DINOFeatureDiscriminator):
         return [(feature, 1.0) for feature in _dino_discriminator_features(discriminator, x)]
-    if isinstance(discriminator, ProjectedConvNeXtDiscriminator):
+    if isinstance(discriminator, (ProjectedConvNeXtDiscriminator, ProjectedGANDiscriminator, OfficialProjectedGANDiscriminator)):
         return discriminator.discriminator_features(x)
     if hasattr(discriminator, "block_in") and hasattr(discriminator, "blocks") and hasattr(discriminator, "pool"):
         return [(feature, 1.0) for feature in _patch_discriminator_features(discriminator, x)]
@@ -1621,12 +2243,26 @@ def build_parser():
     parser.add_argument("--d-every", type=int, default=1)
     parser.add_argument("--lecam-regularization-weight", type=float, default=0.001)
     parser.add_argument("--lecam-ema-decay", type=float, default=0.999)
-    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "dino", "dinov1s", "patch_dino", "multiscale_patch_dino", "projected_convnext", "stylegan"])
+    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "dino", "dinov1s", "patch_dino", "multiscale_patch_dino", "projected_convnext", "projected_gan", "official_projected_gan", "stylegan"])
     parser.add_argument("--stylegan-channel-multiplier", type=int, default=1)
     parser.add_argument("--projected-input-size", type=int, default=224)
     parser.add_argument("--projected-head-hidden", type=int, default=256)
+    parser.add_argument("--projected-backbone", type=str, default="convnext_small", choices=["convnext_small", "convnext_base"])
+    parser.add_argument("--projected-channels", type=int, default=256)
+    parser.add_argument("--projected-normalize-features", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--projected-loss-weights", type=float, nargs="*", default=[1.0, 1.0, 1.0, 1.0])
     parser.add_argument("--projected-pretrained", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--official-pg-input-size", type=int, default=224)
+    parser.add_argument("--official-pg-im-res", type=int, default=256)
+    parser.add_argument("--official-pg-cout", type=int, default=64)
+    parser.add_argument("--official-pg-expand", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--official-pg-proj-type", type=int, default=2, choices=[0, 1, 2])
+    parser.add_argument("--official-pg-num-discs", type=int, default=4, choices=[1, 2, 3, 4])
+    parser.add_argument("--official-pg-separable", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--official-pg-patch", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--official-pg-pretrained", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--official-pg-diffaug", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--official-pg-diffaug-policy", type=str, default="color,translation,cutout")
     parser.add_argument("--disc-scales", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-loss-weights", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-hidden-channels", type=int, default=128)

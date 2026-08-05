@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -30,6 +31,7 @@ from train_titok_llamagen_recon import (
     autocast_dtype,
     build_discriminator,
     build_dino_feature_loss,
+    build_clip_feature_loss,
     build_perceptual_loss,
     chw_to_pil,
     compute_feature_moment_loss,
@@ -119,6 +121,7 @@ def format_run_header(args, dataset_len, world_size, trainable_params):
         f"mix_native:{args.lambda_mix_native}@{args.lambda_mix_native_perceptual}/{args.mix_native_teacher},"
         f"perceptual({args.perceptual_loss}):{get_perceptual_weight(args)},feat:{args.lambda_feat},"
         f"feat_moment:{args.lambda_feat_moment},dino_feat:{args.lambda_dino_feat}/{args.dino_feat_loss},"
+        f"clip_feat:{args.lambda_clip_feat}/{args.clip_model}/{args.clip_pretrained}/{args.clip_feat_loss},"
         f"disc_fm:{args.lambda_disc_feature_matching},lowfreq_anchor:{args.lambda_lowfreq_anchor}@{args.lowfreq_anchor_size},"
         f"gan:{args.lambda_gan}@{args.gan_start_step}+ramp{args.gan_ramp_steps}/"
         f"g_after_dwarm:{getattr(args, 'gan_g_ramp_after_d_warmup', False)}/{args.gan_input_filter}@{args.gan_highpass_size},"
@@ -237,6 +240,30 @@ def set_adapt_train_mode(model, args):
         core.llamagen_vq.decoder.train()
     if hasattr(core, "router"):
         core.router.train(args.train_router)
+
+
+def apply_router_only_trainability(core: TiTokLlamaGenStage2, args, router_only_active: bool):
+    if not router_only_active:
+        configure_trainable_parts(core, args)
+        return
+    core.titok.eval().requires_grad_(False)
+    set_module_trainable(core.latent_decoder, False)
+    core.llamagen_vq.eval()
+    set_module_trainable(getattr(core.llamagen_vq, "encoder", None), False)
+    set_module_trainable(getattr(core.llamagen_vq, "quantize", None), False)
+    set_module_trainable(getattr(core.llamagen_vq, "quant_conv", None), False)
+    set_module_trainable(getattr(core.llamagen_vq, "post_quant_conv", None), False)
+    set_module_trainable(getattr(core.llamagen_vq, "decoder", None), False)
+    set_module_trainable(getattr(core, "router", None), args.train_router)
+
+
+def sync_module_grads(module: nn.Module | None, world_size: int):
+    if module is None or world_size <= 1:
+        return
+    for param in module.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(world_size)
 
 
 def trainable_param_groups(core: TiTokLlamaGenStage2, args):
@@ -531,7 +558,63 @@ class DynamicBudgetRouter(nn.Module):
         return self.score_head(h), self.ratio_head(h)
 
 
-def make_dynamic_budget_ste_mask(logits, ratio_logits, args):
+def calibrate_ratio_logits_to_target_mean(ratio_logits, args):
+    if not bool(args.router_ratio_target_mean_calibrate):
+        return ratio_logits
+    target = float(args.router_target_mean_ratio)
+    min_ratio = float(args.router_min_ratio)
+    max_ratio = float(args.router_max_ratio)
+    target = min(max(target, min_ratio), max_ratio)
+    if max_ratio <= min_ratio:
+        return ratio_logits
+
+    logits = ratio_logits.float()
+    lo = logits.new_full((), -30.0)
+    hi = logits.new_full((), 30.0)
+    for _ in range(max(int(args.router_ratio_target_calibrate_iters), 1)):
+        mid = (lo + hi) * 0.5
+        ratio = min_ratio + (max_ratio - min_ratio) * torch.sigmoid(logits + mid)
+        if float(ratio.mean().item()) < target:
+            lo = mid
+        else:
+            hi = mid
+    return ratio_logits + ((lo + hi) * 0.5).to(dtype=ratio_logits.dtype)
+
+
+def adjust_token_counts_to_total(k, ratio_soft, min_tokens, max_tokens, target_total):
+    k = k.clone()
+    bsz = k.numel()
+    if bsz == 0:
+        return k
+    target_total = int(round(float(target_total)))
+    target_total = max(int(min_tokens) * bsz, min(int(max_tokens) * bsz, target_total))
+    diff = target_total - int(k.sum().item())
+    if diff == 0:
+        return k
+
+    order = torch.argsort(ratio_soft.detach().float().flatten(), descending=diff > 0)
+    while diff != 0:
+        changed = 0
+        for idx in order.tolist():
+            if diff > 0:
+                if int(k[idx].item()) >= int(max_tokens):
+                    continue
+                k[idx] += 1
+                diff -= 1
+            else:
+                if int(k[idx].item()) <= int(min_tokens):
+                    continue
+                k[idx] -= 1
+                diff += 1
+            changed += 1
+            if diff == 0:
+                break
+        if changed == 0:
+            break
+    return k
+
+
+def make_dynamic_budget_ste_mask(logits, ratio_logits, args, budget_debt_tokens=0.0):
     bsz, _channels, height, width = logits.shape
     tokens = height * width
     ratio01 = torch.sigmoid(ratio_logits.float()).flatten()
@@ -541,6 +624,24 @@ def make_dynamic_budget_ste_mask(logits, ratio_logits, args):
     min_tokens = max(0, min(int(min_tokens), tokens))
     max_tokens = max(min_tokens, min(int(max_tokens), tokens))
     k = torch.round(ratio_soft.detach() * tokens).to(dtype=torch.long).clamp(min=min_tokens, max=max_tokens)
+    budget_mode = getattr(args, "router_budget_mode", "soft")
+    if budget_mode in {"batch_exact", "bank"}:
+        target_ratio = float(getattr(args, "router_exact_budget_ratio", -1.0))
+        if target_ratio < 0.0:
+            target_ratio = float(args.router_target_mean_ratio)
+        per_step_target = float(bsz * tokens) * target_ratio
+        if budget_mode == "batch_exact":
+            target_total = per_step_target
+        else:
+            max_debt = max(0.0, float(getattr(args, "router_budget_bank_max_debt_tokens", 0.0)))
+            raw_total = float(k.sum().item())
+            projected_debt = float(budget_debt_tokens) + raw_total - per_step_target
+            target_total = raw_total
+            if projected_debt > max_debt:
+                target_total -= projected_debt - max_debt
+            elif projected_debt < -max_debt:
+                target_total += -max_debt - projected_debt
+        k = adjust_token_counts_to_total(k, ratio_soft, min_tokens, max_tokens, target_total)
 
     flat_logits = logits.flatten(1)
     hard_flat = torch.zeros_like(flat_logits, dtype=torch.float32)
@@ -685,15 +786,26 @@ def parse_prefix_list(value):
     raise TypeError(f"prefix list must be a string or sequence, got {type(value).__name__}")
 
 
-def load_adapt_resume(core: TiTokLlamaGenStage2, ckpt, strict=True, skip_prefixes=()):
-    state = ckpt.get("model", ckpt)
+def load_adapt_resume(core: TiTokLlamaGenStage2, ckpt, strict=True, skip_prefixes=(), use_ema_model=False):
+    if use_ema_model:
+        if not isinstance(ckpt, dict) or "model_ema" not in ckpt:
+            raise ValueError("resume_use_ema_model requested but checkpoint has no model_ema")
+        state = ckpt["model_ema"]
+        fallback_state = None
+    else:
+        state = ckpt.get("model", ckpt)
+        fallback_state = ckpt.get("model_ema") if isinstance(ckpt, dict) else None
     if not isinstance(state, dict):
         raise ValueError("resume checkpoint does not contain a state dict")
+    if fallback_state is not None and not isinstance(fallback_state, dict):
+        fallback_state = None
     skip_prefixes = parse_prefix_list(skip_prefixes)
     current = dict(core.named_parameters())
     missing = []
     unexpected = []
     skipped = []
+    filled_from_ema = []
+    loaded = set()
     with torch.no_grad():
         for name, value in state.items():
             if any(name == prefix or name.startswith(prefix + ".") for prefix in skip_prefixes):
@@ -703,13 +815,24 @@ def load_adapt_resume(core: TiTokLlamaGenStage2, ckpt, strict=True, skip_prefixe
                 unexpected.append(name)
                 continue
             current[name].copy_(value.to(device=current[name].device, dtype=current[name].dtype))
+            loaded.add(name)
+        if fallback_state is not None:
+            for name, param in current.items():
+                if name in loaded or name not in fallback_state:
+                    continue
+                if any(name == prefix or name.startswith(prefix + ".") for prefix in skip_prefixes):
+                    continue
+                value = fallback_state[name]
+                param.copy_(value.to(device=param.device, dtype=param.dtype))
+                loaded.add(name)
+                filled_from_ema.append(name)
         if strict:
             for name, param in current.items():
-                if param.requires_grad and name not in state and not any(name == prefix or name.startswith(prefix + ".") for prefix in skip_prefixes):
+                if param.requires_grad and name not in loaded and not any(name == prefix or name.startswith(prefix + ".") for prefix in skip_prefixes):
                     missing.append(name)
     if strict and (missing or unexpected):
         raise RuntimeError(f"resume mismatch missing={missing} unexpected={unexpected}")
-    return missing, unexpected, skipped
+    return missing, unexpected, skipped, filled_from_ema
 
 
 def compute_path_losses(perceptual, perceptual_name, pred, target, image_loss):
@@ -718,6 +841,49 @@ def compute_path_losses(perceptual, perceptual_name, pred, target, image_loss):
     mse01 = F.mse_loss(image_to_zero_one(pred, "minus1_1").float(), image_to_zero_one(target, "minus1_1").float())
     return image, perc, mse01
 
+
+
+def epoch_fraction_to_steps(value, steps_per_epoch, *, add_one_after=False):
+    value = float(value)
+    if value <= 0.0:
+        return 0
+    steps = max(1, int(round(value * steps_per_epoch)))
+    return steps + (1 if add_one_after else 0)
+
+
+def optimizer_steps_per_epoch(loader_steps_per_epoch, accum_steps):
+    return max(1, int(loader_steps_per_epoch) // max(1, int(accum_steps)))
+
+
+def compute_lr_for_scheduler(args, step, base_lr, scheduler, min_lr=0.0, start_step=0, max_steps=None):
+    if scheduler == "constant":
+        return base_lr
+    if scheduler != "cosine":
+        raise ValueError(f"unsupported lr scheduler {scheduler}")
+    max_steps = args.max_steps if max_steps is None else max_steps
+    rel_step = max(step - start_step, 0)
+    total_steps = max(max_steps - start_step, 1)
+    if args.warmup_steps > 0 and rel_step < args.warmup_steps:
+        return base_lr * rel_step / args.warmup_steps
+    denom = max(total_steps - args.warmup_steps, 1)
+    progress = min(max((rel_step - args.warmup_steps) / denom, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+def apply_epoch_native_schedule(args, start_step, steps_per_epoch):
+    if float(getattr(args, "epochs", 0.0)) > 0.0:
+        args.max_steps = start_step + epoch_fraction_to_steps(args.epochs, steps_per_epoch)
+    if float(getattr(args, "warmup_epochs", 0.0)) > 0.0:
+        args.warmup_steps = epoch_fraction_to_steps(args.warmup_epochs, steps_per_epoch)
+    if float(getattr(args, "router_only_epochs", 0.0)) > 0.0:
+        args.router_only_steps = epoch_fraction_to_steps(args.router_only_epochs, steps_per_epoch)
+    if float(getattr(args, "d_warmup_epochs", 0.0)) > 0.0:
+        args.d_warmup_steps = epoch_fraction_to_steps(args.d_warmup_epochs, steps_per_epoch)
+    if float(getattr(args, "g_freeze_epochs", 0.0)) > 0.0:
+        args.g_freeze_steps = epoch_fraction_to_steps(args.g_freeze_epochs, steps_per_epoch)
+    if float(getattr(args, "gan_start_epoch", -1.0)) >= 0.0:
+        args.gan_start_step = start_step + epoch_fraction_to_steps(args.gan_start_epoch, steps_per_epoch, add_one_after=True)
 
 
 def init_wandb_run(args, out_dir, dataset_len, world_size, trainable_count, is_main):
@@ -779,7 +945,8 @@ def main(args):
         persistent_workers=args.num_workers > 0,
     )
     data_iter = cycle(loader, sampler)
-    steps_per_epoch = max(1, len(loader))
+    loader_steps_per_epoch = max(1, len(loader))
+    steps_per_epoch = optimizer_steps_per_epoch(loader_steps_per_epoch, args.accum_steps)
 
     titok = load_titok(args.titok_root, args.titok_config, args.titok_ckpt, device)
     vq_model = load_llamagen_vq(args.llamagen_root, args.llamagen_ckpt, device, args.codebook_size, args.codebook_embed_dim)
@@ -797,6 +964,7 @@ def main(args):
         native_teacher_vq.eval().requires_grad_(False)
     perceptual = build_perceptual_loss(args, device)
     dino_feature_loss = build_dino_feature_loss(args, device)
+    clip_feature_loss = build_clip_feature_loss(args, device)
 
     model = TiTokLlamaGenStage2(
         titok,
@@ -845,13 +1013,22 @@ def main(args):
     )
     lecam_ema_real = torch.zeros((), device=device)
     lecam_ema_fake = torch.zeros((), device=device)
+    router_budget_debt_tokens = 0.0
 
     start_step = 0
     selector_threshold_state = float(args.selector_threshold)
     selector_ratio_ema = float(args.target_mask_ratio)
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
-        missing, unexpected, skipped = load_adapt_resume(core, ckpt, strict=not args.resume_non_strict, skip_prefixes=args.resume_skip_prefixes)
+        missing, unexpected, skipped, filled_from_ema = load_adapt_resume(
+            core,
+            ckpt,
+            strict=not args.resume_non_strict,
+            skip_prefixes=args.resume_skip_prefixes,
+            use_ema_model=args.resume_use_ema_model,
+        )
+        if args.resume_use_ema_model:
+            print("[resume] loaded model weights from checkpoint model_ema", flush=True)
         start_step = int(ckpt.get("step", 0)) if isinstance(ckpt, dict) else 0
         if isinstance(ckpt, dict) and "optimizer" in ckpt and not args.reset_optimizer:
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -881,6 +1058,7 @@ def main(args):
             if not args.reset_selector_state:
                 selector_threshold_state = float(ckpt.get("selector_threshold_state", selector_threshold_state))
                 selector_ratio_ema = float(ckpt.get("selector_ratio_ema", selector_ratio_ema))
+                router_budget_debt_tokens = float(ckpt.get("router_budget_debt_tokens", router_budget_debt_tokens))
         if ema is not None:
             if isinstance(ckpt, dict) and "model_ema" in ckpt:
                 ema.load_state_dict(ckpt["model_ema"], device=device)
@@ -893,9 +1071,13 @@ def main(args):
         if is_main:
             if skipped:
                 print(f"skipped {len(skipped)} resume params with prefixes {parse_prefix_list(args.resume_skip_prefixes)}", flush=True)
+            if filled_from_ema:
+                print(f"filled {len(filled_from_ema)} resume params from model_ema fallback", flush=True)
             if discriminator_load_mode != "none":
                 print(f"loaded discriminator from resume ({discriminator_load_mode})", flush=True)
             print(f"resumed decoder-adapt checkpoint from {args.resume} at step {start_step}", flush=True)
+
+    apply_epoch_native_schedule(args, start_step, steps_per_epoch)
 
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
@@ -920,7 +1102,13 @@ def main(args):
         core = model.module if distributed else model
         n_trainable = sum(p.numel() for p in core.parameters() if p.requires_grad)
         msg, run_header = format_run_header(args, len(dataset), world_size, n_trainable)
-        epoch_msg = f"steps_per_epoch={steps_per_epoch} latest_every_epoch={args.latest_every_epoch} save_epoch_every={args.save_epoch_every}"
+        epoch_msg = (
+            f"loader_steps_per_epoch={loader_steps_per_epoch} optimizer_steps_per_epoch={steps_per_epoch} "
+            f"epochs={args.epochs} max_steps={args.max_steps} "
+            f"router_only_steps={args.router_only_steps} gan_start_step={args.gan_start_step} "
+            f"d_warmup_steps={args.d_warmup_steps} latest_every_epoch={args.latest_every_epoch} "
+            f"save_epoch_every={args.save_epoch_every} save_epoch_fraction_every={args.save_epoch_fraction_every}"
+        )
         print(msg, flush=True)
         print(epoch_msg, flush=True)
         with log_path.open("a") as f:
@@ -945,6 +1133,7 @@ def main(args):
         "feat": 0.0,
         "feat_moment": 0.0,
         "dino_feat": 0.0,
+        "clip_feat": 0.0,
         "gan_g": 0.0,
         "disc_fm": 0.0,
         "lowfreq_anchor": 0.0,
@@ -965,6 +1154,7 @@ def main(args):
         "selector_ratio_ema": 0.0,
         "router_budget": 0.0,
         "router_binary": 0.0,
+        "router_budget_debt": 0.0,
         "router_aux": 0.0,
         "router_ratio_target": 0.0,
         "router_ratio_target_std": 0.0,
@@ -976,16 +1166,26 @@ def main(args):
     }
     count = 0
     start_time = time.time()
-    pbar = tqdm(total=max(0, args.max_steps - start_step), desc=f"Steps {start_step + 1}-{args.max_steps}", disable=not is_main, dynamic_ncols=True, mininterval=2)
-    d_warmup_end_step = start_step + max(0, args.d_warmup_steps) if args.reset_discriminator else 0
+    pbar_desc = f"Epoch 0.00/{args.epochs:g}" if float(args.epochs) > 0.0 else f"Steps {start_step + 1}-{args.max_steps}"
+    pbar = tqdm(total=max(0, args.max_steps - start_step), desc=pbar_desc, disable=not is_main, dynamic_ncols=True, mininterval=2)
+    d_warmup_start_step = max(start_step + 1, args.gan_start_step) if args.reset_discriminator else 0
+    d_warmup_end_step = d_warmup_start_step + max(0, args.d_warmup_steps) - 1 if args.reset_discriminator and args.d_warmup_steps > 0 else 0
 
     for step in range(start_step + 1, args.max_steps + 1):
         set_adapt_train_mode(model, args)
         core = model.module if distributed else model
         current_lr = compute_lr(args, step, base_lr=args.lr)
         current_lr_lg = compute_lr(args, step, base_lr=args.lr_llamagen)
-        current_lr_d = compute_lr(args, step, base_lr=args.lr_d, start_step=args.gan_start_step)
+        current_lr_d = compute_lr_for_scheduler(
+            args,
+            step,
+            base_lr=args.lr_d,
+            scheduler=args.lr_d_scheduler,
+            min_lr=args.min_lr_d,
+            start_step=args.gan_start_step,
+        )
         router_only_active = args.mask_selection == "router_e2e_dynamic" and args.router_only_steps > 0 and step <= start_step + args.router_only_steps
+        apply_router_only_trainability(core, args, router_only_active)
         g_freeze_active = args.g_freeze_steps > 0 and step <= start_step + args.g_freeze_steps
         for group in optimizer.param_groups:
             role = group.get("lr_role")
@@ -1004,7 +1204,11 @@ def main(args):
         gan_factor = gan_factor_for_step(args, step)
         if router_only_active and args.router_only_disable_gan:
             gan_factor = 0.0
-        d_warmup_active = discriminator is not None and args.d_warmup_steps > 0 and step <= d_warmup_end_step
+        d_warmup_active = (
+            discriminator is not None
+            and args.d_warmup_steps > 0
+            and d_warmup_start_step <= step <= d_warmup_end_step
+        )
         gan_g_factor = gan_g_factor_for_step(args, step, d_warmup_end_step)
         if router_only_active and args.router_only_disable_gan:
             gan_g_factor = 0.0
@@ -1032,6 +1236,7 @@ def main(args):
             "score_variance": 0.0,
             "selector_threshold": float(selector_threshold_state),
             "selector_ratio_ema": float(selector_ratio_ema),
+            "router_budget_debt_tokens": float(router_budget_debt_tokens),
         }
         if args.mask_selection == "accum_global_error":
             score_chunks = []
@@ -1064,6 +1269,7 @@ def main(args):
                 "score_variance": global_mean_value(norm_parts["variance"]),
                 "selector_threshold": float(selector_threshold_state),
                 "selector_ratio_ema": float(selector_ratio_ema),
+                "router_budget_debt_tokens": float(router_budget_debt_tokens),
             }
         elif args.mask_selection == "accum_global_mixed_score_threshold":
             raw_chunks = {"error": [], "gradient": [], "variance": []}
@@ -1104,8 +1310,22 @@ def main(args):
             }
 
         for _micro_step, (_x_01, x_titok, x_lg) in enumerate(accum_batches):
-            with torch.autocast(device_type="cuda", dtype=autocast_dtype(args.mixed_precision), enabled=args.mixed_precision != "none"):
-                x_base, extra = model(x_titok)
+            sync_micro_step = _micro_step == len(accum_batches) - 1
+            model_for_forward = core if router_only_active else model
+            model_sync_context = (
+                model.no_sync()
+                if distributed and not router_only_active and not sync_micro_step and isinstance(model, DDP)
+                else contextlib.nullcontext()
+            )
+            disc_sync_context = (
+                discriminator.no_sync()
+                if distributed and not sync_micro_step and isinstance(discriminator, DDP)
+                else contextlib.nullcontext()
+            )
+            with model_sync_context, disc_sync_context, torch.autocast(
+                device_type="cuda", dtype=autocast_dtype(args.mixed_precision), enabled=args.mixed_precision != "none"
+            ):
+                x_base, extra = model_for_forward(x_titok)
                 f_1d_lg = extra["f_1d_lg"]
                 f_2d_lg, _ = native_llamagen_feature(
                     core.llamagen_vq,
@@ -1129,9 +1349,20 @@ def main(args):
                 local_score_metric_values = score_metric_values
                 if args.mask_selection == "router_e2e_dynamic":
                     router_logits, router_ratio_logits = core.router(f_1d_lg, x_base, f_2d_lg)
+                    router_ratio_logits = calibrate_ratio_logits_to_target_mean(router_ratio_logits, args)
                     mask, hard_mask, router_soft_mask, router_ratio_soft = make_dynamic_budget_ste_mask(
-                        router_logits, router_ratio_logits, args
+                        router_logits, router_ratio_logits, args, budget_debt_tokens=router_budget_debt_tokens
                     )
+                    if getattr(args, "router_budget_mode", "soft") == "bank":
+                        target_ratio_for_bank = float(getattr(args, "router_exact_budget_ratio", -1.0))
+                        if target_ratio_for_bank < 0.0:
+                            target_ratio_for_bank = float(args.router_target_mean_ratio)
+                        router_budget_debt_tokens += float(hard_mask.detach().float().sum().item()) - (
+                            hard_mask.shape[0] * hard_mask.shape[2] * hard_mask.shape[3] * target_ratio_for_bank
+                        )
+                        max_debt_for_bank = max(0.0, float(getattr(args, "router_budget_bank_max_debt_tokens", 0.0)))
+                        if max_debt_for_bank > 0.0:
+                            router_budget_debt_tokens = max(-max_debt_for_bank, min(max_debt_for_bank, router_budget_debt_tokens))
                     mask = mask.to(dtype=f_1d_lg.dtype)
                     router_soft_mean = router_soft_mask.float().mean()
                     router_ratio_mean = router_ratio_soft.float().mean()
@@ -1153,7 +1384,12 @@ def main(args):
                     mask = precomputed_masks[_micro_step].to(device=f_1d_lg.device, dtype=f_1d_lg.dtype)
                 f_mix = (1.0 - mask) * f_1d_lg + mask * f_2d_lg
                 x_mix = core.llamagen_vq.decoder(f_mix)
-                x_native = core.llamagen_vq.decoder(f_2d_lg)
+                needs_native_grad = float(args.lambda_native) > 0.0
+                if needs_native_grad:
+                    x_native = core.llamagen_vq.decoder(f_2d_lg)
+                else:
+                    with torch.no_grad():
+                        x_native = core.llamagen_vq.decoder(f_2d_lg.detach())
                 x_native_teacher = x_native.detach()
                 if native_teacher_vq is not None:
                     with torch.no_grad():
@@ -1165,17 +1401,47 @@ def main(args):
                         )
                         x_native_teacher = native_teacher_vq.decoder(f_2d_teacher).detach()
 
-                base_img, base_lp, base_mse01 = compute_path_losses(perceptual, args.perceptual_loss, x_base, x_lg, args.image_loss)
+                if float(args.lambda_base) > 0.0:
+                    base_img, base_lp, base_mse01 = compute_path_losses(
+                        perceptual, args.perceptual_loss, x_base, x_lg, args.image_loss
+                    )
+                else:
+                    with torch.no_grad():
+                        base_img, base_lp, base_mse01 = compute_path_losses(
+                            perceptual, args.perceptual_loss, x_base.detach(), x_lg, args.image_loss
+                        )
                 mix_img, mix_lp, mix_mse01 = compute_path_losses(perceptual, args.perceptual_loss, x_mix, x_lg, args.image_loss)
-                native_img, native_lp, native_mse01 = compute_path_losses(perceptual, args.perceptual_loss, x_native, x_lg, args.image_loss)
-                mix_native_img, mix_native_lp, _ = compute_path_losses(
-                    perceptual, args.perceptual_loss, x_mix, x_native_teacher, args.image_loss
-                )
+                if float(args.lambda_native) > 0.0:
+                    native_img, native_lp, native_mse01 = compute_path_losses(
+                        perceptual, args.perceptual_loss, x_native, x_lg, args.image_loss
+                    )
+                else:
+                    with torch.no_grad():
+                        native_img, native_lp, native_mse01 = compute_path_losses(
+                            perceptual, args.perceptual_loss, x_native.detach(), x_lg, args.image_loss
+                        )
+                if float(args.lambda_mix_native) > 0.0:
+                    mix_native_img, mix_native_lp, _ = compute_path_losses(
+                        perceptual, args.perceptual_loss, x_mix, x_native_teacher, args.image_loss
+                    )
+                else:
+                    with torch.no_grad():
+                        mix_native_img, mix_native_lp, _ = compute_path_losses(
+                            perceptual, args.perceptual_loss, x_mix.detach(), x_native_teacher, args.image_loss
+                        )
                 feat_loss = F.l1_loss(f_1d_lg.float(), f_2d_lg.detach().float())
                 feat_moment = compute_feature_moment_loss(f_1d_lg.float(), f_2d_lg.detach().float())
                 dino_feat_loss = x_mix.new_zeros(())
                 if dino_feature_loss is not None and float(args.lambda_dino_feat) > 0.0:
                     dino_feat_loss = dino_feature_loss(
+                        x_mix,
+                        x_lg,
+                        pred_range=args.llamagen_input_range,
+                        target_range=args.llamagen_input_range,
+                    )
+                clip_feat_loss = x_mix.new_zeros(())
+                if clip_feature_loss is not None and float(args.lambda_clip_feat) > 0.0:
+                    clip_feat_loss = clip_feature_loss(
                         x_mix,
                         x_lg,
                         pred_range=args.llamagen_input_range,
@@ -1196,7 +1462,8 @@ def main(args):
                     router_aux_weight > 0.0 or float(args.lambda_router_ratio_target) > 0.0
                 )
                 if needs_ratio_target:
-                    gain_score = grid_mse_gain_score(x_base, x_native, x_lg, grid_hw=16)
+                    with torch.no_grad():
+                        gain_score = grid_mse_gain_score(x_base.detach(), x_native.detach(), x_lg, grid_hw=16)
                     if float(args.router_ratio_target_spread) > 0.0 or float(args.lambda_router_ratio_target) > 0.0:
                         router_ratio_target = image_ratio_target_from_gain_score(gain_score, args)
                     if router_aux_weight > 0.0:
@@ -1211,10 +1478,22 @@ def main(args):
                         router_ratio_target_loss = F.smooth_l1_loss(router_ratio_soft.float(), router_ratio_target.float())
 
                 perceptual_weight = get_perceptual_weight(args)
-                base_loss = args.lambda_base * (base_img + perceptual_weight * base_lp)
+                base_loss = (
+                    args.lambda_base * (base_img + perceptual_weight * base_lp)
+                    if float(args.lambda_base) > 0.0
+                    else x_mix.new_zeros(())
+                )
                 mix_loss = args.lambda_mix * (mix_img + perceptual_weight * mix_lp)
-                native_loss = args.lambda_native * (native_img + perceptual_weight * native_lp)
-                mix_native_loss = args.lambda_mix_native * (mix_native_img + args.lambda_mix_native_perceptual * mix_native_lp)
+                native_loss = (
+                    args.lambda_native * (native_img + perceptual_weight * native_lp)
+                    if float(args.lambda_native) > 0.0
+                    else x_mix.new_zeros(())
+                )
+                mix_native_loss = (
+                    args.lambda_mix_native * (mix_native_img + args.lambda_mix_native_perceptual * mix_native_lp)
+                    if float(args.lambda_mix_native) > 0.0
+                    else x_mix.new_zeros(())
+                )
                 gan_g_loss = x_mix.new_zeros(())
                 disc_fm_loss = x_mix.new_zeros(())
                 if discriminator is not None and gan_g_factor > 0.0 and not d_warmup_active:
@@ -1238,6 +1517,7 @@ def main(args):
                     + args.lambda_feat * feat_loss
                     + args.lambda_feat_moment * feat_moment
                     + args.lambda_dino_feat * dino_feat_loss
+                    + args.lambda_clip_feat * clip_feat_loss
                     + args.lambda_lowfreq_anchor * lowfreq_anchor_loss
                     + args.lambda_disc_feature_matching * disc_fm_loss
                     + args.lambda_gan * gan_g_factor * gan_g_loss
@@ -1273,8 +1553,8 @@ def main(args):
                 )
                 real_for_d = real_for_d.detach()
                 fake_for_d = fake_for_d.detach()
-                logits_both = discriminator(torch.cat([real_for_d, fake_for_d], dim=0))
-                logits_real, logits_fake = split_discriminator_logits(logits_both, chunks=2, dim=0)
+                logits_real = discriminator(real_for_d)
+                logits_fake = discriminator(fake_for_d)
                 logits_real_mean = weighted_logits_mean(logits_real)
                 logits_fake_mean = weighted_logits_mean(logits_fake)
                 d_loss = gan_factor * hinge_d_loss(logits_real, logits_fake)
@@ -1305,6 +1585,7 @@ def main(args):
             metric_sums["feat"] += feat_loss.detach().float().item()
             metric_sums["feat_moment"] += feat_moment.detach().float().item()
             metric_sums["dino_feat"] += dino_feat_loss.detach().float().item()
+            metric_sums["clip_feat"] += clip_feat_loss.detach().float().item()
             metric_sums["gan_g"] += (args.lambda_gan * gan_g_factor * gan_g_loss).detach().float().item()
             metric_sums["disc_fm"] += (args.lambda_disc_feature_matching * disc_fm_loss).detach().float().item()
             metric_sums["lowfreq_anchor"] += (args.lambda_lowfreq_anchor * lowfreq_anchor_loss).detach().float().item()
@@ -1312,6 +1593,7 @@ def main(args):
             metric_sums["lecam"] += lecam_loss.detach().float().item()
             metric_sums["router_budget"] += router_budget_loss.detach().float().item()
             metric_sums["router_binary"] += router_binary_loss.detach().float().item()
+            metric_sums["router_budget_debt"] += float(router_budget_debt_tokens)
             metric_sums["router_aux"] += router_aux_loss.detach().float().item()
             metric_sums["router_ratio_target"] += 0.0 if router_ratio_target is None else router_ratio_target.detach().float().mean().item()
             metric_sums["router_ratio_target_std"] += 0.0 if router_ratio_target is None else router_ratio_target.detach().float().std(unbiased=False).item()
@@ -1339,6 +1621,9 @@ def main(args):
                 "mask": mask,
             }
 
+        if distributed and router_only_active:
+            sync_module_grads(getattr(core, "router", None), world_size)
+
         grad_norm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
         if not g_freeze_active:
             optimizer.step()
@@ -1365,6 +1650,7 @@ def main(args):
                 metric_sums["feat"] / args.accum_steps,
                 metric_sums["feat_moment"] / args.accum_steps,
                 metric_sums["dino_feat"] / args.accum_steps,
+                metric_sums["clip_feat"] / args.accum_steps,
                 metric_sums["gan_g"] / args.accum_steps,
                 metric_sums["disc_fm"] / args.accum_steps,
                 metric_sums["lowfreq_anchor"] / args.accum_steps,
@@ -1385,6 +1671,7 @@ def main(args):
                 metric_sums["selector_ratio_ema"] / args.accum_steps,
                 metric_sums["router_budget"] / args.accum_steps,
                 metric_sums["router_binary"] / args.accum_steps,
+                metric_sums["router_budget_debt"] / args.accum_steps,
                 metric_sums["router_aux"] / args.accum_steps,
                 metric_sums["router_ratio_target"] / args.accum_steps,
                 metric_sums["router_ratio_target_std"] / args.accum_steps,
@@ -1402,11 +1689,11 @@ def main(args):
         keys = [
             "loss", "base", "base_lp", "base_mse01", "mix", "mix_lp", "mix_mse01",
             "mix_native", "mix_native_lp",
-            "native", "native_lp", "native_mse01", "feat", "feat_moment", "dino_feat",
+            "native", "native_lp", "native_mse01", "feat", "feat_moment", "dino_feat", "clip_feat",
             "gan_g", "disc_fm", "lowfreq_anchor", "d_loss", "lecam", "logits_real", "logits_fake",
             "mask", "mask_tokens", "mask_tokens_std", "mask_tokens_min", "mask_tokens_max",
             "score", "score_error", "score_gradient", "score_variance",
-            "selector_threshold", "selector_ratio_ema", "router_budget", "router_binary",
+            "selector_threshold", "selector_ratio_ema", "router_budget", "router_binary", "router_budget_debt",
             "router_aux", "router_ratio_target", "router_ratio_target_std", "router_ratio_target_loss",
             "router_ratio", "router_ratio_std", "router_soft", "grad",
         ]
@@ -1418,11 +1705,27 @@ def main(args):
         base_mse = running["base_mse01"] / denom
         mix_mse = running["mix_mse01"] / denom
         native_mse = running["native_mse01"] / denom
+        loss_avg = running["loss"] / denom
+        gan_avg = running["gan_g"] / denom
+        perceptual_weight_log = get_perceptual_weight(args)
+        recon_avg = (
+            args.lambda_base * (running["base"] / denom + perceptual_weight_log * running["base_lp"] / denom)
+            + args.lambda_mix * (running["mix"] / denom + perceptual_weight_log * running["mix_lp"] / denom)
+            + args.lambda_native * (running["native"] / denom + perceptual_weight_log * running["native_lp"] / denom)
+            + args.lambda_mix_native
+            * (running["mix_native"] / denom + args.lambda_mix_native_perceptual * running["mix_native_lp"] / denom)
+        )
+        gan_abs_frac = abs(gan_avg) / max(abs(loss_avg), 1e-12)
+        gan_recon_frac = abs(gan_avg) / max(abs(recon_avg), 1e-12)
 
         if is_main:
             pbar.update(1)
+            epoch_progress = float(step - start_step) / float(steps_per_epoch)
+            if float(args.epochs) > 0.0:
+                pbar.set_description(f"Epoch {epoch_progress:.2f}/{args.epochs:g}")
             pbar.set_postfix({
                 "step": step,
+                "epoch": f"{epoch_progress:.2f}",
                 "mix_l1": f"{running['mix'] / denom:.3f}",
                 "mix_lp": f"{running['mix_lp'] / denom:.3f}",
                 "psnr": f"{(-10.0 * math.log10(max(mix_mse, 1e-12))):.2f}",
@@ -1431,15 +1734,18 @@ def main(args):
                 "tok": f"{running['mask_tokens'] / denom:.0f}",
                 "thr": f"{running['selector_threshold'] / denom:.3f}",
                 "rb": f"{running['router_budget'] / denom:.3f}",
+                "debt": f"{running['router_budget_debt'] / denom:.0f}",
                 "rr": f"{running['router_ratio'] / denom:.2f}",
-                "gan": f"{running['gan_g'] / denom:.3f}",
+                "gan": f"{gan_avg:.3f}",
+                "g%": f"{100.0 * gan_abs_frac:.1f}",
+                "gr%": f"{100.0 * gan_recon_frac:.1f}",
                 "fm": f"{running['disc_fm'] / denom:.3f}",
                 "lf": f"{running['lowfreq_anchor'] / denom:.3f}",
                 "d": f"{running['d_loss'] / denom:.3f}",
                 "phase": "g_freeze" if g_freeze_active else ("router" if router_only_active else "joint"),
             })
 
-        if is_main and (step == start_step + 1 or step % args.log_every == 0):
+        if is_main and (step == 1 or step % args.log_every == 0):
             with torch.no_grad():
                 f_1d_lg = last["f_1d_lg"]
                 f_2d_lg = last["f_2d_lg"]
@@ -1456,6 +1762,7 @@ def main(args):
                     f"sel_score {running['score']/denom:.3f} err_score {running['score_error']/denom:.3f} "
                     f"grad_score {running['score_gradient']/denom:.3f} var_score {running['score_variance']/denom:.3f} "
                     f"router_budget {running['router_budget']/denom:.5f} router_binary {running['router_binary']/denom:.5f} "
+                    f"router_debt {running['router_budget_debt']/denom:.1f} "
                     f"router_aux {running['router_aux']/denom:.5f} router_ratio {running['router_ratio']/denom:.3f} "
                     f"ratio_tgt {running['router_ratio_target']/denom:.3f} "
                     f"ratio_std {running['router_ratio_std']/denom:.3f} "
@@ -1470,10 +1777,11 @@ def main(args):
                 f"native {running['native']/denom:.5f} lp {running['native_lp']/denom:.5f} psnr {(-10.0 * math.log10(max(native_mse, 1e-12))):.2f} | "
                 f"mix_native {running['mix_native']/denom:.5f} lp {running['mix_native_lp']/denom:.5f} | "
                 f"feat {running['feat']/denom:.5f} feat_moment {running['feat_moment']/denom:.5f} "
-                f"dino_feat {running['dino_feat']/denom:.5f} | "
-                f"gan_g {running['gan_g']/denom:.5f} disc_fm {running['disc_fm']/denom:.5f} lowfreq_anchor {running['lowfreq_anchor']/denom:.5f} | d {running['d_loss']/denom:.5f} | "
+                f"dino_feat {running['dino_feat']/denom:.5f} clip_feat {running['clip_feat']/denom:.5f} | "
+                f"gan_g {gan_avg:.5f} gan_abs_frac {gan_abs_frac:.5f} gan_recon_frac {gan_recon_frac:.5f} "
+                f"disc_fm {running['disc_fm']/denom:.5f} lowfreq_anchor {running['lowfreq_anchor']/denom:.5f} | d {running['d_loss']/denom:.5f} | "
                 f"router_budget {running['router_budget']/denom:.5f} router_binary {running['router_binary']/denom:.5f} "
-                f"router_aux {running['router_aux']/denom:.5f} "
+                f"router_debt {running['router_budget_debt']/denom:.1f} router_aux {running['router_aux']/denom:.5f} "
                 f"ratio_tgt_std {running['router_ratio_target_std']/denom:.3f} "
                 f"ratio_tgt_loss {running['router_ratio_target_loss']/denom:.5f} | "
                 f"lecam {running['lecam']/denom:.5f} | d_real {running['logits_real']/denom:.4f} | "
@@ -1487,6 +1795,8 @@ def main(args):
             if wandb_run is not None:
                 log_metrics = {f"train/{key}": running[key] / denom for key in keys}
                 log_metrics.update({
+                    "train/gan_abs_frac": gan_abs_frac,
+                    "train/gan_recon_frac": gan_recon_frac,
                     "train/base_psnr": -10.0 * math.log10(max(base_mse, 1e-12)),
                     "train/mix_psnr": -10.0 * math.log10(max(mix_mse, 1e-12)),
                     "train/native_psnr": -10.0 * math.log10(max(native_mse, 1e-12)),
@@ -1521,6 +1831,12 @@ def main(args):
             and trained_steps > 0
             and trained_steps % steps_per_epoch == 0
         )
+        fraction_save_every_steps = epoch_fraction_to_steps(args.save_epoch_fraction_every, steps_per_epoch)
+        epoch_fraction_due = (
+            fraction_save_every_steps > 0
+            and trained_steps > 0
+            and trained_steps % fraction_save_every_steps == 0
+        )
         completed_epochs = trained_steps // steps_per_epoch if trained_steps > 0 else 0
         save_epoch_due = (
             args.save_epoch_every > 0
@@ -1528,8 +1844,11 @@ def main(args):
             and completed_epochs > 0
             and completed_epochs % args.save_epoch_every == 0
         )
-        save_latest_due = (args.save_every > 0 and step % args.save_every == 0) or epoch_boundary_due
-        save_periodic_step_due = args.save_step_checkpoints and args.save_every > 0 and step % args.save_every == 0
+        save_latest_due = (args.save_every > 0 and step % args.save_every == 0) or epoch_boundary_due or epoch_fraction_due
+        save_periodic_step_due = (
+            args.save_step_checkpoints
+            and ((args.save_every > 0 and step % args.save_every == 0) or epoch_fraction_due)
+        )
         save_explicit_step_due = step in save_steps
         if is_main and (save_latest_due or save_periodic_step_due or save_explicit_step_due or save_epoch_due):
             core = model.module if distributed else model
@@ -1591,6 +1910,7 @@ def build_parser():
     parser.add_argument("--adapter-init", type=str, default="")
     parser.add_argument("--adapter-init-ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--resume-use-ema-model", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resume-non-strict", action="store_true", default=False)
     parser.add_argument("--resume-skip-prefixes", nargs="*", default=[])
     parser.add_argument("--reset-optimizer", action="store_true", default=False)
@@ -1604,6 +1924,7 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--accum-steps", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--epochs", type=float, default=0.0)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--limit-samples", type=int, default=0)
     parser.add_argument("--lr", type=float, default=0.0)
@@ -1612,6 +1933,7 @@ def build_parser():
     parser.add_argument("--lr-router", type=float, default=1e-4)
     parser.add_argument("--lr-scheduler", type=str, default="constant", choices=["constant", "cosine"])
     parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-epochs", type=float, default=0.0)
     parser.add_argument("--min-lr", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--weight-decay-llamagen", type=float, default=0.0)
@@ -1644,6 +1966,15 @@ def build_parser():
     parser.add_argument("--lambda-lowfreq-anchor", type=float, default=0.0)
     parser.add_argument("--lowfreq-anchor-size", type=int, default=32)
     parser.add_argument("--lambda-dino-feat", type=float, default=0.0)
+    parser.add_argument("--lambda-clip-feat", type=float, default=0.0)
+    parser.add_argument("--clip-model", type=str, default="ViT-B-32")
+    parser.add_argument("--clip-pretrained", type=str, default="openai")
+    parser.add_argument("--clip-cache-dir", type=str, default=None)
+    parser.add_argument("--clip-prefer-hf-hub", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--clip-weights-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--clip-feat-loss", type=str, default="l1", choices=["l1", "l2"])
+    parser.add_argument("--clip-feat-input-size", type=int, default=None)
+    parser.add_argument("--clip-feat-normalize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dino-feat-loss", type=str, default="l1", choices=["l1", "l2"])
     parser.add_argument("--dino-feat-input-size", type=int, default=224)
     parser.add_argument("--dino-feat-use-patch-tokens", action=argparse.BooleanOptionalAction, default=True)
@@ -1653,23 +1984,43 @@ def build_parser():
     parser.add_argument("--lambda-router-ratio-target", type=float, default=0.0)
     parser.add_argument("--lambda-gan", type=float, default=0.0)
     parser.add_argument("--gan-start-step", type=int, default=0)
+    parser.add_argument("--gan-start-epoch", type=float, default=-1.0)
     parser.add_argument("--gan-ramp-steps", type=int, default=0)
     parser.add_argument("--gan-g-ramp-after-d-warmup", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gan-input-filter", type=str, default="none", choices=["none", "highfreq_composite", "highfreq_grad_only"])
     parser.add_argument("--gan-highpass-size", type=int, default=64)
     parser.add_argument("--discriminator-factor", type=float, default=1.0)
     parser.add_argument("--lr-d", type=float, default=1.0e-5)
+    parser.add_argument("--lr-d-scheduler", type=str, default="constant", choices=["constant", "cosine"])
+    parser.add_argument("--min-lr-d", type=float, default=0.0)
     parser.add_argument("--d-every", type=int, default=1)
     parser.add_argument("--d-warmup-steps", type=int, default=0)
+    parser.add_argument("--d-warmup-epochs", type=float, default=0.0)
     parser.add_argument("--g-freeze-steps", type=int, default=0)
+    parser.add_argument("--g-freeze-epochs", type=float, default=0.0)
     parser.add_argument("--lecam-regularization-weight", type=float, default=0.001)
     parser.add_argument("--lecam-ema-decay", type=float, default=0.999)
-    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "dino", "dinov1s", "patch_dino", "multiscale_patch_dino", "projected_convnext", "stylegan"])
+    parser.add_argument("--discriminator-type", type=str, default="patch", choices=["patch", "multiscale_patch", "dino", "dinov1s", "patch_dino", "multiscale_patch_dino", "projected_convnext", "projected_gan", "official_projected_gan", "stylegan"])
     parser.add_argument("--stylegan-channel-multiplier", type=int, default=1)
     parser.add_argument("--projected-input-size", type=int, default=224)
     parser.add_argument("--projected-head-hidden", type=int, default=256)
+    parser.add_argument("--projected-head-depth", type=int, default=2)
+    parser.add_argument("--projected-backbone", type=str, default="convnext_small", choices=["convnext_small", "convnext_base"])
+    parser.add_argument("--projected-channels", type=int, default=256)
+    parser.add_argument("--projected-normalize-features", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--projected-loss-weights", type=float, nargs="*", default=[1.0, 1.0, 1.0, 1.0])
     parser.add_argument("--projected-pretrained", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--official-pg-input-size", type=int, default=224)
+    parser.add_argument("--official-pg-im-res", type=int, default=256)
+    parser.add_argument("--official-pg-cout", type=int, default=64)
+    parser.add_argument("--official-pg-expand", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--official-pg-proj-type", type=int, default=2, choices=[0, 1, 2])
+    parser.add_argument("--official-pg-num-discs", type=int, default=4, choices=[1, 2, 3, 4])
+    parser.add_argument("--official-pg-separable", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--official-pg-patch", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--official-pg-pretrained", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--official-pg-diffaug", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--official-pg-diffaug-policy", type=str, default="color,translation,cutout")
     parser.add_argument("--disc-scales", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-loss-weights", type=float, nargs="*", default=[1.0])
     parser.add_argument("--disc-hidden-channels", type=int, default=128)
@@ -1706,6 +2057,11 @@ def build_parser():
     parser.add_argument("--router-min-ratio", type=float, default=0.05)
     parser.add_argument("--router-max-ratio", type=float, default=0.90)
     parser.add_argument("--router-target-mean-ratio", type=float, default=0.50)
+    parser.add_argument("--router-budget-mode", type=str, default="soft", choices=["soft", "batch_exact", "bank"])
+    parser.add_argument("--router-exact-budget-ratio", type=float, default=-1.0)
+    parser.add_argument("--router-budget-bank-max-debt-tokens", type=float, default=1024.0)
+    parser.add_argument("--router-ratio-target-mean-calibrate", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--router-ratio-target-calibrate-iters", type=int, default=24)
     parser.add_argument("--router-min-tokens", type=int, default=-1)
     parser.add_argument("--router-max-tokens", type=int, default=-1)
     parser.add_argument("--router-tau", type=float, default=0.7)
@@ -1715,6 +2071,7 @@ def build_parser():
     parser.add_argument("--router-gain-aux-target-ratio", type=float, default=0.5)
     parser.add_argument("--router-ratio-target-spread", type=float, default=0.0)
     parser.add_argument("--router-only-steps", type=int, default=0)
+    parser.add_argument("--router-only-epochs", type=float, default=0.0)
     parser.add_argument("--router-only-disable-gan", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--wandb-project", type=str, default="MoT")
@@ -1726,6 +2083,7 @@ def build_parser():
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--latest-every-epoch", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-epoch-every", type=int, default=0)
+    parser.add_argument("--save-epoch-fraction-every", type=float, default=0.0)
     parser.add_argument("--save-step-checkpoints", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-steps", type=int, nargs="*", default=[])
     parser.add_argument("--sample-every", type=int, default=200)

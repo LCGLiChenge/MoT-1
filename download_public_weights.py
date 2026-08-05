@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Download public pretrained weights needed by the current MoT H200 run.
 
-This does not download our private/trained checkpoints:
+This does not download our private/trained checkpoint:
   - weights/step_00066000.pt
-  - weights/step_00094000.pt
 
 Use --test to download into a temporary directory and delete the test files after
 basic validation.

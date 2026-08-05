@@ -85,6 +85,42 @@ def ssim_sum(pred: torch.Tensor, target: torch.Tensor, image_range: str, structu
     return sum(float(structural_similarity(t, p, data_range=1.0, channel_axis=2)) for p, t in zip(pred_np, target_np))
 
 
+def build_lpips_metric(args, device):
+    if args.lpips_net == "llamagen_vgg":
+        add_path(args.llamagen_root)
+        from tokenizer.tokenizer_image.lpips import LPIPS
+
+        return LPIPS().to(device).eval().requires_grad_(False)
+    try:
+        import lpips
+    except Exception as exc:
+        raise ImportError("lpips is required for LPIPS evaluation unless --lpips-net llamagen_vgg is used.") from exc
+    return lpips.LPIPS(net=args.lpips_net).to(device).eval().requires_grad_(False)
+
+
+def calibrate_ratio_logits_to_target_mean(ratio_logits, args):
+    target = float(args.router_eval_target_mean_ratio)
+    if target < 0.0:
+        return ratio_logits
+    min_ratio = float(args.router_min_ratio)
+    max_ratio = float(args.router_max_ratio)
+    target = min(max(target, min_ratio), max_ratio)
+    if max_ratio <= min_ratio:
+        return ratio_logits
+
+    logits = ratio_logits.float()
+    lo = logits.new_full((), -30.0)
+    hi = logits.new_full((), 30.0)
+    for _ in range(max(int(args.router_eval_target_calibrate_iters), 1)):
+        mid = (lo + hi) * 0.5
+        ratio = min_ratio + (max_ratio - min_ratio) * torch.sigmoid(logits + mid)
+        if float(ratio.mean().item()) < target:
+            lo = mid
+        else:
+            hi = mid
+    return ratio_logits + ((lo + hi) * 0.5).to(dtype=ratio_logits.dtype)
+
+
 def load_trainable_params(model: TiTokLlamaGenStage2, ckpt_path: str, require_latent_decoder: bool = False, use_model_ema: bool = False):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if use_model_ema:
@@ -160,30 +196,32 @@ class PathMetricAccumulator:
         self.mse01 = 0.0
         self.count = 0
 
-    def update(self, pred, target, image_range, lpips_fn, structural_similarity):
+    def update(self, pred, target, image_range, lpips_fn, structural_similarity, lpips_only=False):
         bsz = pred.shape[0]
-        self.psnr += float(psnr_sum(pred, target, image_range).item())
-        self.ssim += ssim_sum(pred, target, image_range, structural_similarity)
         self.lpips += float(lpips_fn(pred.float(), target.float()).mean().item()) * bsz
-        self.l1 += float(F.l1_loss(pred.float(), target.float(), reduction="mean").item()) * bsz
-        pred01 = image_to_zero_one(pred, image_range)
-        target01 = image_to_zero_one(target, image_range)
-        self.mse01 += float(F.mse_loss(pred01.float(), target01.float(), reduction="mean").item()) * bsz
+        if not lpips_only:
+            self.psnr += float(psnr_sum(pred, target, image_range).item())
+            self.ssim += ssim_sum(pred, target, image_range, structural_similarity)
+            self.l1 += float(F.l1_loss(pred.float(), target.float(), reduction="mean").item()) * bsz
+            pred01 = image_to_zero_one(pred, image_range)
+            target01 = image_to_zero_one(target, image_range)
+            self.mse01 += float(F.mse_loss(pred01.float(), target01.float(), reduction="mean").item()) * bsz
         self.count += bsz
 
     def compute(self, fid_value):
         count = max(self.count, 1)
         mse01 = self.mse01 / count
         psnr_avg_image = self.psnr / count
+        lpips_only = self.mse01 == 0.0 and self.psnr == 0.0 and self.ssim == 0.0 and self.l1 == 0.0
         return {
-            "fid": float(fid_value),
+            "fid": None if fid_value is None else float(fid_value),
             "lpips": self.lpips / count,
-            "psnr": psnr_avg_image,
-            "psnr_avg_image": psnr_avg_image,
-            "psnr_from_mse01": -10.0 * math.log10(max(mse01, 1e-12)),
-            "ssim": self.ssim / count,
-            "l1": self.l1 / count,
-            "mse01": mse01,
+            "psnr": None if lpips_only else psnr_avg_image,
+            "psnr_avg_image": None if lpips_only else psnr_avg_image,
+            "psnr_from_mse01": None if lpips_only else -10.0 * math.log10(max(mse01, 1e-12)),
+            "ssim": None if lpips_only else self.ssim / count,
+            "l1": None if lpips_only else self.l1 / count,
+            "mse01": None if lpips_only else mse01,
         }
 
 
@@ -193,19 +231,16 @@ def main(args):
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-    try:
-        from torchmetrics.image.fid import FrechetInceptionDistance
-    except Exception as exc:
-        raise ImportError("torchmetrics with FID support is required for FID evaluation.") from exc
+    FrechetInceptionDistance = None
+    if not (args.no_fid or args.lpips_only):
+        try:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+        except Exception as exc:
+            raise ImportError("torchmetrics with FID support is required for FID evaluation.") from exc
     try:
         from skimage.metrics import structural_similarity
     except Exception as exc:
         raise ImportError("scikit-image is required for SSIM evaluation.") from exc
-    try:
-        import lpips
-    except Exception as exc:
-        raise ImportError("lpips is required for LPIPS evaluation.") from exc
-
     add_path(args.llamagen_root)
     from dataset.augmentation import center_crop_arr
 
@@ -269,12 +304,13 @@ def main(args):
     )
 
     eval_paths = list(dict.fromkeys(args.eval_paths))
-    fids = {
+    no_fid = args.no_fid or args.lpips_only
+    fids = {} if no_fid else {
         name: FrechetInceptionDistance(feature=args.fid_feature, normalize=False).to(device)
         for name in eval_paths
     }
-    acc = {name: PathMetricAccumulator() for name in fids}
-    lpips_fn = lpips.LPIPS(net=args.lpips_net).to(device).eval().requires_grad_(False)
+    acc = {name: PathMetricAccumulator() for name in eval_paths}
+    lpips_fn = build_lpips_metric(args, device)
     dtype = autocast_dtype(args.mixed_precision)
     autocast_enabled = device.type == "cuda" and args.mixed_precision != "none"
     mask_sum = 0.0
@@ -330,6 +366,7 @@ def main(args):
                     score_primary_key = "error"
                 elif args.mask_selection == "router_e2e_dynamic":
                     router_logits, router_ratio_logits = model.router(f_1d, x_base, f_2d)
+                    router_ratio_logits = calibrate_ratio_logits_to_target_mean(router_ratio_logits, args)
                     mask, hard_mask, router_soft_mask, router_ratio_soft = make_dynamic_budget_ste_mask(
                         router_logits, router_ratio_logits, args
                     )
@@ -382,21 +419,22 @@ def main(args):
                     raise ValueError(f"unsupported mask_selection {args.mask_selection}")
                 f_mix = (1.0 - mask) * f_1d + mask * f_2d
                 x_mix = model.llamagen_vq.decoder(f_mix)
-                if x_native is None and "native" in fids:
+                if x_native is None and "native" in eval_paths:
                     x_native = model.llamagen_vq.decoder(f_2d)
             paths = {}
-            if "base" in fids:
+            if "base" in eval_paths:
                 paths["base"] = x_base.float()
-            if "mix" in fids:
+            if "mix" in eval_paths:
                 paths["mix"] = x_mix.float()
-            if "native" in fids:
+            if "native" in eval_paths:
                 paths["native"] = x_native.float()
             target = target.float()
             real_uint8 = to_uint8(target, args.llamagen_input_range)
             for name, pred in paths.items():
-                fids[name].update(real_uint8, real=True)
-                fids[name].update(to_uint8(pred, args.llamagen_input_range), real=False)
-                acc[name].update(pred, target, args.llamagen_input_range, lpips_fn, structural_similarity)
+                if not no_fid:
+                    fids[name].update(real_uint8, real=True)
+                    fids[name].update(to_uint8(pred, args.llamagen_input_range), real=False)
+                acc[name].update(pred, target, args.llamagen_input_range, lpips_fn, structural_similarity, lpips_only=args.lpips_only)
             bsz = target.shape[0]
             mask_float = mask.float()
             mask_tokens = mask_float.flatten(1).sum(dim=1)
@@ -455,6 +493,8 @@ def main(args):
         "router_min_ratio": args.router_min_ratio,
         "router_max_ratio": args.router_max_ratio,
         "router_target_mean_ratio": args.router_target_mean_ratio,
+        "router_eval_target_mean_ratio": args.router_eval_target_mean_ratio,
+        "router_eval_target_calibrate_iters": args.router_eval_target_calibrate_iters,
         "router_tau": args.router_tau,
         "mask_mean": mask_sum / max(count, 1),
         "mask_tokens_mean": mask_tokens_mean,
@@ -467,8 +507,11 @@ def main(args):
         "score_variance_mean": score_variance_sum / max(count, 1),
         "feat_l1": feat_l1_sum / max(count, 1),
         "eval_paths": eval_paths,
+        "lpips_net": args.lpips_net,
+        "no_fid": bool(no_fid),
+        "lpips_only": bool(args.lpips_only),
         "reconstruction": {
-            name: acc[name].compute(fids[name].compute().item())
+            name: acc[name].compute(None if no_fid else fids[name].compute().item())
             for name in eval_paths
         },
     }
@@ -520,6 +563,8 @@ def parse_args():
     parser.add_argument("--router-min-ratio", type=float, default=0.05)
     parser.add_argument("--router-max-ratio", type=float, default=0.90)
     parser.add_argument("--router-target-mean-ratio", type=float, default=0.50)
+    parser.add_argument("--router-eval-target-mean-ratio", type=float, default=-1.0)
+    parser.add_argument("--router-eval-target-calibrate-iters", type=int, default=24)
     parser.add_argument("--router-min-tokens", type=int, default=-1)
     parser.add_argument("--router-max-tokens", type=int, default=-1)
     parser.add_argument("--router-tau", type=float, default=0.7)
@@ -531,6 +576,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fid-feature", type=int, default=2048)
     parser.add_argument("--lpips-net", type=str, default="alex")
+    parser.add_argument("--no-fid", action="store_true", default=False)
+    parser.add_argument("--lpips-only", action="store_true", default=False)
     parser.add_argument("--eval-paths", type=str, nargs="+", default=["base", "mix", "native"], choices=["base", "mix", "native"])
     parser.add_argument("--lg-latent-channels", type=int, default=256)
     parser.add_argument("--lg-head-channels", type=int, default=256)
