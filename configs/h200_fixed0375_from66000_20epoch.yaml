@@ -149,7 +149,7 @@ sample_every: 0
 sample_images: 0
 save_every: 0
 latest_every_epoch: true
-save_epoch_every: 5
+save_epoch_every: 10
 save_step_checkpoints: false
 save_steps: []
 wandb: true

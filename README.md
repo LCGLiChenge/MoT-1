@@ -114,7 +114,7 @@ full training starts after 0.5 epoch
 gan_start_epoch: 1.5
 d_warmup_epochs: 0.01
 lambda_gan: 0.12
-save: latest.pt every epoch, plus epoch checkpoints every 5 epochs
+save: latest.pt every epoch, plus epoch checkpoints every 10 epochs
 ```
 
 ## 8. Eval

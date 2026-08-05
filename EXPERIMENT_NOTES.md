@@ -26,6 +26,7 @@ lambda_dino_feat: 0.5
 lambda_clip_feat: 0.5
 lambda_disc_feature_matching: 0.5
 EMA enabled
+save_epoch_every: 10
 ```
 
 The copied training script includes the 2026-08-04 memory fixes:
