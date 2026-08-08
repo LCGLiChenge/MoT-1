@@ -1,21 +1,21 @@
 # Current Experiment Notes
 
-## H200 fixed 0.375 from 66000
+## H200 fixed 0.5 from 66000
 
 Date: 2026-08-05
 
-This handoff package is for the fixed-ratio 0.375 Router-selection run from the clean 66000 checkpoint.
+This handoff package is for the fixed-ratio 0.5 Router-selection run from the clean 66000 checkpoint.
 
 Key setup:
 
 ```text
 checkpoint: weights/step_00066000.pt
-output_dir: results/h200_fixed0375_from66000_20epoch_bs24
+output_dir: results/h200_fixed050_from66000_20epoch_bs24
 8 H200 GPUs
 batch_size: 24 per GPU
 accum_steps: 1
 epochs: 20
-Router selects exactly 96 / 256 grids per image
+Router selects exactly 128 / 256 grids per image
 Router-only: first 0.5 epoch
 Full training without GAN: 0.5 to 1.5 epoch
 GAN/D warmup starts after 1.5 epoch
@@ -26,7 +26,7 @@ lambda_dino_feat: 0.5
 lambda_clip_feat: 0.5
 lambda_disc_feature_matching: 0.5
 EMA enabled
-save_epoch_every: 10
+save_epoch_every: 0
 ```
 
 The copied training script includes the 2026-08-04 memory fixes:
@@ -45,13 +45,13 @@ Smoke command shape:
 
 ```text
 torchrun --standalone --nproc_per_node=4 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py
-  --config configs/h200_fixed0375_from66000_20epoch.yaml
+  --config configs/h200_fixed050_from66000_20epoch.yaml
   --batch-size 1 --accum-steps 1 --limit-samples 8 --epochs 2.5
   --resume /home/.../version4/results/.../step_00066000.pt
   --adapter-init /home/.../version4/results/.../step_00066000.pt
   --dino-repo /home/heyefei/.cache/torch/hub/facebookresearch_dinov2_main
   --clip-cache-dir /home/heyefei/.cache/open_clip
-  --output-dir /tmp/mot_h200_fixed0375_smoke
+  --output-dir /tmp/mot_h200_fixed050_smoke
 ```
 
 Result:
@@ -68,4 +68,4 @@ step 66004: phase=joint D warmup, gan=0, d=1.007
 step 66005: phase=joint, gan=0.027, g%=2.1, gr%=5.2, d=1.078
 ```
 
-Smoke output `/tmp/mot_h200_fixed0375_smoke` was deleted after verification.
+Smoke output `/tmp/mot_h200_fixed050_smoke` was deleted after verification.

@@ -1,6 +1,6 @@
-# MoT-1 H200 Fixed 0.375 Run
+# MoT-1 H200 Fixed 0.5 Run
 
-This repo is a minimal handoff package for the current MoT experiment. It trains the fixed-ratio 0.375 Router-selection version from the clean 66000 checkpoint on 8 H200 GPUs.
+This repo is a minimal handoff package for the current MoT experiment. It trains the fixed-ratio 0.5 Router-selection version from the clean 66000 checkpoint on 8 H200 GPUs.
 
 ## 1. Clone
 
@@ -74,7 +74,7 @@ Use a tiny run before launching the full job:
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 \
 torchrun --standalone --nproc_per_node=1 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
-  --config configs/h200_fixed0375_from66000_20epoch.yaml \
+  --config configs/h200_fixed050_from66000_20epoch.yaml \
   --batch-size 1 \
   --accum-steps 1 \
   --limit-samples 8 \
@@ -88,17 +88,17 @@ torchrun --standalone --nproc_per_node=1 train_titok_llamagen_decoder_adapt_rout
   --sample-every 0 \
   --no-wandb \
   --log-every 1 \
-  --output-dir results/smoke_h200_fixed0375_from66000
+  --output-dir results/smoke_h200_fixed050_from66000
 ```
 
-Delete only `results/smoke_h200_fixed0375_from66000` after the smoke test passes.
+Delete only `results/smoke_h200_fixed050_from66000` after the smoke test passes.
 
 ## 7. Train On 8 H200 GPUs
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
-  --config configs/h200_fixed0375_from66000_20epoch.yaml
+  --config configs/h200_fixed050_from66000_20epoch.yaml
 ```
 
 Main settings:
@@ -108,27 +108,27 @@ resume: weights/step_00066000.pt
 batch_size: 24 per GPU
 accum_steps: 1
 epochs: 20
-ratio: fixed 0.375, exactly 96 grids per image
+ratio: fixed 0.5, exactly 128 grids per image
 router_only_epochs: 0.5
 full training starts after 0.5 epoch
 gan_start_epoch: 1.5
 d_warmup_epochs: 0.01
 lambda_gan: 0.12
-save: latest.pt every epoch, plus epoch checkpoints every 10 epochs
+save: latest.pt only; no step or epoch checkpoint files
 ```
 
 ## 8. Eval
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
-  --config configs/eval_h200_fixed0375_50000.yaml
+  --config configs/eval_h200_fixed050_50000.yaml
 ```
 
 For a specific checkpoint:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
-  --config configs/eval_h200_fixed0375_50000.yaml \
-  --ckpt results/h200_fixed0375_from66000_20epoch_bs24/latest.pt \
-  --output-json results/h200_fixed0375_from66000_20epoch_bs24/eval_latest_50000.json
+  --config configs/eval_h200_fixed050_50000.yaml \
+  --ckpt results/h200_fixed050_from66000_20epoch_bs24/latest.pt \
+  --output-json results/h200_fixed050_from66000_20epoch_bs24/eval_latest_50000.json
 ```

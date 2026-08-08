@@ -1,9 +1,9 @@
-ckpt: results/h200_fixed0375_from66000_20epoch_bs24/latest.pt
+ckpt: results/h200_fixed050_from66000_20epoch_bs24/latest.pt
 adapter_init: weights/step_00066000.pt
 adapter_init_ema: true
 use_model_ema: true
 data_path: ../ImageNet/validation
-output_json: results/h200_fixed0375_from66000_20epoch_bs24/eval_latest_50000.json
+output_json: results/h200_fixed050_from66000_20epoch_bs24/eval_latest_50000.json
 num_images: 50000
 batch_size: 64
 num_workers: 8
@@ -14,7 +14,7 @@ mixed_precision: bf16
 mask_selection: router_e2e_dynamic
 mask_ratio_min: 0.1
 mask_ratio_max: 0.9
-mask_ratio: 0.375
+mask_ratio: 0.5
 mask_error_weight: 0.6
 mask_gradient_weight: 0.3
 mask_variance_weight: 0.1
@@ -23,11 +23,11 @@ use_checkpoint_selector_threshold: true
 score_normalize_scope: per_image
 router_hidden_dim: 128
 router_depth: 3
-router_min_ratio: 0.375
-router_max_ratio: 0.375
-router_target_mean_ratio: 0.375
-router_min_tokens: 96
-router_max_tokens: 96
+router_min_ratio: 0.5
+router_max_ratio: 0.5
+router_target_mean_ratio: 0.5
+router_min_tokens: 128
+router_max_tokens: 128
 router_tau: 0.7
 router_detach_inputs: true
 eval_paths:
