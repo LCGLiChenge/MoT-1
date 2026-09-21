@@ -24,7 +24,7 @@ from models import TiTokLlamaGenStage2
 
 
 DINO_V1_MODEL_ALIASES = {"dinov1_vits16", "dino_vits16", "dino_deitsmall16"}
-DEFAULT_DINO_V1_CKPT = "/home/heyefei/.cache/torch/hub/checkpoints/dino_deitsmall16_pretrain.pth"
+DEFAULT_DINO_V1_CKPT = "../.cache/torch/hub/checkpoints/dino_deitsmall16_pretrain.pth"
 
 
 def add_path(path):
@@ -39,6 +39,10 @@ def load_titok(titok_root, config_path, ckpt_path, device):
 
     config = OmegaConf.load(config_path)
     tokenizer = TiTok(config)
+    if os.environ.get("MOT_SKIP_TITOK_INITIAL_WEIGHTS") == "1":
+        tokenizer.to(device)
+        tokenizer.eval()
+        return tokenizer
     if str(ckpt_path).endswith(".safetensors"):
         state = load_safetensors_file(str(ckpt_path), device="cpu")
     else:
@@ -56,6 +60,10 @@ def load_llamagen_vq(llamagen_root, ckpt_path, device, codebook_size=16384, code
     from tokenizer.tokenizer_image.vq_model import VQ_models
 
     vq = VQ_models["VQ-16"](codebook_size=codebook_size, codebook_embed_dim=codebook_embed_dim)
+    if os.environ.get("MOT_SKIP_LLAMAGEN_INITIAL_WEIGHTS") == "1":
+        vq.to(device)
+        vq.eval().requires_grad_(False)
+        return vq
     ckpt = torch.load(ckpt_path, map_location="cpu")
     if isinstance(ckpt, dict) and "ema" in ckpt:
         state = ckpt["ema"]

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 
 import torch
@@ -20,6 +21,7 @@ from models import TiTokLlamaGenStage2
 from train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic import (
     DynamicBudgetRouter,
     make_dynamic_budget_ste_mask,
+    make_top_p_ste_mask,
 )
 from train_titok_llamagen_decoder_adapt_global_gain_texture import (
     global_mean_value,
@@ -48,12 +50,23 @@ IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 class EvalImageDataset(Dataset):
-    def __init__(self, root: str, image_size: int, center_crop_arr):
+    def __init__(self, root: str, image_size: int, center_crop_arr, dataset_manifest: str = ""):
         self.root = Path(root)
-        self.paths = sorted(
-            p for p in self.root.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMG_EXTENSIONS
-        )
+        if dataset_manifest:
+            payload = torch.load(dataset_manifest, map_location="cpu", weights_only=False)
+            required = {"root", "samples"}
+            if not isinstance(payload, dict) or not required.issubset(payload):
+                raise ValueError(f"invalid dataset manifest schema: {dataset_manifest}")
+            if Path(payload["root"]).resolve() != self.root.resolve():
+                raise ValueError(
+                    f"stale dataset manifest root: expected {self.root.resolve()}, got {payload['root']}"
+                )
+            self.paths = [Path(path) for path, _target in payload["samples"]]
+        else:
+            self.paths = sorted(
+                p for p in self.root.rglob("*")
+                if p.is_file() and p.suffix.lower() in IMG_EXTENSIONS
+            )
         if not self.paths:
             raise FileNotFoundError(f"No images found under {self.root}")
         self.transform = transforms.Compose([
@@ -121,6 +134,29 @@ def calibrate_ratio_logits_to_target_mean(ratio_logits, args):
     return ratio_logits + ((lo + hi) * 0.5).to(dtype=ratio_logits.dtype)
 
 
+CHECKPOINT_FILENAME = re.compile(r"epoch_(\d+)_step_(\d+)\.pt$")
+
+
+def checkpoint_identity(checkpoint, ckpt_path: str):
+    ckpt_step = int(checkpoint.get("step", -1)) if isinstance(checkpoint, dict) else -1
+    ckpt_epoch = int(checkpoint.get("epoch", -1)) if isinstance(checkpoint, dict) else -1
+    match = CHECKPOINT_FILENAME.search(Path(ckpt_path).name)
+    if match is not None:
+        filename_epoch = int(match.group(1))
+        filename_step = int(match.group(2))
+        if ckpt_step >= 0 and ckpt_step != filename_step:
+            raise RuntimeError(
+                f"checkpoint step mismatch: metadata={ckpt_step} filename={filename_step}: {ckpt_path}"
+            )
+        if ckpt_epoch >= 0 and ckpt_epoch != filename_epoch:
+            raise RuntimeError(
+                f"checkpoint epoch mismatch: metadata={ckpt_epoch} filename={filename_epoch}: {ckpt_path}"
+            )
+        ckpt_step = filename_step
+        ckpt_epoch = filename_epoch
+    return ckpt_step, ckpt_epoch
+
+
 def load_trainable_params(model: TiTokLlamaGenStage2, ckpt_path: str, require_latent_decoder: bool = False, use_model_ema: bool = False):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if use_model_ema:
@@ -146,8 +182,7 @@ def load_trainable_params(model: TiTokLlamaGenStage2, ckpt_path: str, require_la
                     missing.append(name)
     if missing or unexpected:
         raise RuntimeError(f"checkpoint mismatch: missing={missing[:10]} unexpected={unexpected[:10]}")
-    ckpt_step = int(ckpt.get("step", -1)) if isinstance(ckpt, dict) else -1
-    ckpt_epoch = int(ckpt.get("epoch", -1)) if isinstance(ckpt, dict) else -1
+    ckpt_step, ckpt_epoch = checkpoint_identity(ckpt, ckpt_path)
     selector_threshold_state = ckpt.get("selector_threshold_state") if isinstance(ckpt, dict) else None
     selector_ratio_ema = ckpt.get("selector_ratio_ema") if isinstance(ckpt, dict) else None
     return ckpt_step, ckpt_epoch, copied, selector_threshold_state, selector_ratio_ema
@@ -188,7 +223,8 @@ def threshold_mask_from_score(score, selector_threshold):
 
 
 class PathMetricAccumulator:
-    def __init__(self):
+    def __init__(self, compute_ssim: bool = True):
+        self.compute_ssim = bool(compute_ssim)
         self.psnr = 0.0
         self.ssim = 0.0
         self.lpips = 0.0
@@ -201,7 +237,8 @@ class PathMetricAccumulator:
         self.lpips += float(lpips_fn(pred.float(), target.float()).mean().item()) * bsz
         if not lpips_only:
             self.psnr += float(psnr_sum(pred, target, image_range).item())
-            self.ssim += ssim_sum(pred, target, image_range, structural_similarity)
+            if self.compute_ssim:
+                self.ssim += ssim_sum(pred, target, image_range, structural_similarity)
             self.l1 += float(F.l1_loss(pred.float(), target.float(), reduction="mean").item()) * bsz
             pred01 = image_to_zero_one(pred, image_range)
             target01 = image_to_zero_one(target, image_range)
@@ -219,7 +256,7 @@ class PathMetricAccumulator:
             "psnr": None if lpips_only else psnr_avg_image,
             "psnr_avg_image": None if lpips_only else psnr_avg_image,
             "psnr_from_mse01": None if lpips_only else -10.0 * math.log10(max(mse01, 1e-12)),
-            "ssim": None if lpips_only else self.ssim / count,
+            "ssim": None if (lpips_only or not self.compute_ssim) else self.ssim / count,
             "l1": None if lpips_only else self.l1 / count,
             "mse01": None if lpips_only else mse01,
         }
@@ -237,10 +274,12 @@ def main(args):
             from torchmetrics.image.fid import FrechetInceptionDistance
         except Exception as exc:
             raise ImportError("torchmetrics with FID support is required for FID evaluation.") from exc
-    try:
-        from skimage.metrics import structural_similarity
-    except Exception as exc:
-        raise ImportError("scikit-image is required for SSIM evaluation.") from exc
+    structural_similarity = None
+    if not (args.lpips_only or args.no_ssim):
+        try:
+            from skimage.metrics import structural_similarity
+        except Exception as exc:
+            raise ImportError("scikit-image is required for SSIM evaluation.") from exc
     add_path(args.llamagen_root)
     from dataset.augmentation import center_crop_arr
 
@@ -291,7 +330,12 @@ def main(args):
         selector_threshold = float(args.mask_ratio)
     model.eval().requires_grad_(False)
 
-    dataset = EvalImageDataset(args.data_path, args.image_size, center_crop_arr)
+    dataset = EvalImageDataset(
+        args.data_path,
+        args.image_size,
+        center_crop_arr,
+        dataset_manifest=args.dataset_manifest,
+    )
     if args.num_images > 0:
         dataset = Subset(dataset, range(min(args.num_images, len(dataset))))
     loader = DataLoader(
@@ -309,7 +353,7 @@ def main(args):
         name: FrechetInceptionDistance(feature=args.fid_feature, normalize=False).to(device)
         for name in eval_paths
     }
-    acc = {name: PathMetricAccumulator() for name in eval_paths}
+    acc = {name: PathMetricAccumulator(compute_ssim=not args.no_ssim) for name in eval_paths}
     lpips_fn = build_lpips_metric(args, device)
     dtype = autocast_dtype(args.mixed_precision)
     autocast_enabled = device.type == "cuda" and args.mixed_precision != "none"
@@ -324,6 +368,11 @@ def main(args):
     score_variance_sum = 0.0
     feat_l1_sum = 0.0
     count = 0
+    top_p_grid_stats = {
+        (float(temperature), float(top_p)): {"count": 0, "sum": 0.0, "sq_sum": 0.0, "min": None, "max": None}
+        for temperature in args.router_top_p_temperature_grid
+        for top_p in args.router_top_p_grid
+    }
 
     with torch.no_grad():
         pbar = tqdm(loader, desc="eval_mix", dynamic_ncols=True)
@@ -379,6 +428,38 @@ def main(args):
                         "variance": zeros,
                     }
                     score_primary_key = "gradient"
+                elif args.mask_selection == "router_e2e_top_p":
+                    router_logits, _router_ratio_logits = model.router(f_1d, x_base, f_2d)
+                    _mask, hard_mask, router_soft_mask, _router_ratio_soft = make_top_p_ste_mask(
+                        router_logits, args
+                    )
+                    mask = hard_mask.to(dtype=f_1d.dtype)
+                    score = torch.softmax(
+                        router_logits.detach().float().flatten(1) / float(args.router_top_p_temperature), dim=1
+                    ).view_as(router_logits)
+                    zeros = torch.zeros_like(score)
+                    norm_parts = {
+                        "error": zeros,
+                        "gradient": router_soft_mask.detach().float(),
+                        "variance": zeros,
+                    }
+                    score_primary_key = "gradient"
+                    if top_p_grid_stats:
+                        flat_logits = router_logits.detach().float().flatten(1)
+                        for temperature in args.router_top_p_temperature_grid:
+                            probabilities = torch.softmax(flat_logits / float(temperature), dim=1)
+                            sorted_probabilities = torch.sort(probabilities, dim=1, descending=True).values
+                            cumulative_before = torch.cumsum(sorted_probabilities, dim=1) - sorted_probabilities
+                            for top_p in args.router_top_p_grid:
+                                token_counts = (cumulative_before < float(top_p)).sum(dim=1).float()
+                                stats = top_p_grid_stats[(float(temperature), float(top_p))]
+                                stats["count"] += int(token_counts.numel())
+                                stats["sum"] += float(token_counts.sum().item())
+                                stats["sq_sum"] += float((token_counts * token_counts).sum().item())
+                                batch_min = float(token_counts.min().item())
+                                batch_max = float(token_counts.max().item())
+                                stats["min"] = batch_min if stats["min"] is None else min(stats["min"], batch_min)
+                                stats["max"] = batch_max if stats["max"] is None else max(stats["max"], batch_max)
                 elif args.mask_selection == "gain_first_texture":
                     x_native = model.llamagen_vq.decoder(f_2d)
                     raw_parts = {
@@ -470,6 +551,7 @@ def main(args):
         "adapter_init_step": adapter_step,
         "use_model_ema": bool(args.use_model_ema),
         "data_path": str(args.data_path),
+        "dataset_manifest": str(args.dataset_manifest),
         "num_images": count,
         "image_size": args.image_size,
         "seed": args.seed,
@@ -496,6 +578,19 @@ def main(args):
         "router_eval_target_mean_ratio": args.router_eval_target_mean_ratio,
         "router_eval_target_calibrate_iters": args.router_eval_target_calibrate_iters,
         "router_tau": args.router_tau,
+        "router_top_p": args.router_top_p,
+        "router_top_p_temperature": args.router_top_p_temperature,
+        "router_top_p_ste_tau": args.router_top_p_ste_tau,
+        "top_p_grid": {
+            f"temperature={temperature:g},p={top_p:g}": {
+                "count": stats["count"],
+                "mean": stats["sum"] / max(stats["count"], 1),
+                "std": math.sqrt(max(stats["sq_sum"] / max(stats["count"], 1) - (stats["sum"] / max(stats["count"], 1)) ** 2, 0.0)),
+                "min": stats["min"],
+                "max": stats["max"],
+            }
+            for (temperature, top_p), stats in top_p_grid_stats.items()
+        },
         "mask_mean": mask_sum / max(count, 1),
         "mask_tokens_mean": mask_tokens_mean,
         "mask_tokens_std": math.sqrt(mask_tokens_var),
@@ -509,6 +604,9 @@ def main(args):
         "eval_paths": eval_paths,
         "lpips_net": args.lpips_net,
         "no_fid": bool(no_fid),
+        "fid_feature": None if no_fid else int(args.fid_feature),
+        "fid_normalize": False,
+        "no_ssim": bool(args.no_ssim),
         "lpips_only": bool(args.lpips_only),
         "reconstruction": {
             name: acc[name].compute(None if no_fid else fids[name].compute().item())
@@ -539,6 +637,7 @@ def parse_args():
     parser.add_argument("--adapter-init", type=str, default="")
     parser.add_argument("--adapter-init-ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--data-path", type=str, default="../ImageNet/validation")
+    parser.add_argument("--dataset-manifest", type=str, default="")
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--device", type=str, default="")
     parser.add_argument("--num-images", type=int, default=2000)
@@ -548,7 +647,7 @@ def parse_args():
     parser.add_argument("--titok-input-range", type=str, default="zero_1", choices=["zero_1", "minus1_1"])
     parser.add_argument("--llamagen-input-range", type=str, default="minus1_1", choices=["zero_1", "minus1_1"])
     parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["bf16", "fp16", "none"])
-    parser.add_argument("--mask-selection", type=str, default="batch_global_mixed_score", choices=["per_image_error_random", "batch_global_mixed_score", "accum_global_mixed_score_threshold", "gain_first_texture", "gain_mixed_blend", "router_e2e_dynamic"])
+    parser.add_argument("--mask-selection", type=str, default="batch_global_mixed_score", choices=["per_image_error_random", "batch_global_mixed_score", "accum_global_mixed_score_threshold", "gain_first_texture", "gain_mixed_blend", "router_e2e_dynamic", "router_e2e_top_p"])
     parser.add_argument("--mask-ratio-min", type=float, default=0.1)
     parser.add_argument("--mask-ratio-max", type=float, default=0.9)
     parser.add_argument("--mask-ratio", type=float, default=0.5)
@@ -568,6 +667,11 @@ def parse_args():
     parser.add_argument("--router-min-tokens", type=int, default=-1)
     parser.add_argument("--router-max-tokens", type=int, default=-1)
     parser.add_argument("--router-tau", type=float, default=0.7)
+    parser.add_argument("--router-top-p", type=float, default=0.95)
+    parser.add_argument("--router-top-p-temperature", type=float, default=1.0)
+    parser.add_argument("--router-top-p-ste-tau", type=float, default=0.01)
+    parser.add_argument("--router-top-p-grid", type=float, nargs="*", default=[])
+    parser.add_argument("--router-top-p-temperature-grid", type=float, nargs="*", default=[])
     parser.add_argument("--router-detach-inputs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gain-texture-alpha", type=float, default=0.2)
     parser.add_argument("--gain-gradient-weight", type=float, default=0.5)
@@ -577,6 +681,7 @@ def parse_args():
     parser.add_argument("--fid-feature", type=int, default=2048)
     parser.add_argument("--lpips-net", type=str, default="alex")
     parser.add_argument("--no-fid", action="store_true", default=False)
+    parser.add_argument("--no-ssim", action="store_true", default=False)
     parser.add_argument("--lpips-only", action="store_true", default=False)
     parser.add_argument("--eval-paths", type=str, nargs="+", default=["base", "mix", "native"], choices=["base", "mix", "native"])
     parser.add_argument("--lg-latent-channels", type=int, default=256)

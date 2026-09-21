@@ -19,9 +19,9 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import ImageFolder
+from torchvision.datasets.folder import IMG_EXTENSIONS, default_loader
 from tqdm import tqdm
 
 from models import TiTokLlamaGenStage2
@@ -662,6 +662,40 @@ def make_dynamic_budget_ste_mask(logits, ratio_logits, args, budget_debt_tokens=
     return mask.to(dtype=logits.dtype), hard_mask, soft_mask, ratio_soft
 
 
+def make_top_p_ste_mask(logits, args):
+    """Build an exact hard top-p mask with a differentiable prefix surrogate."""
+    if logits.ndim != 4 or logits.shape[1] != 1:
+        raise ValueError(f"top-p router logits must have shape [B,1,H,W], got {tuple(logits.shape)}")
+    top_p = float(args.router_top_p)
+    temperature = float(args.router_top_p_temperature)
+    ste_tau = float(args.router_top_p_ste_tau)
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError(f"router_top_p must be in (0,1], got {top_p}")
+    if temperature <= 0.0:
+        raise ValueError(f"router_top_p_temperature must be positive, got {temperature}")
+    if ste_tau <= 0.0:
+        raise ValueError(f"router_top_p_ste_tau must be positive, got {ste_tau}")
+
+    flat_logits = logits.float().flatten(1)
+    probabilities = torch.softmax(flat_logits / temperature, dim=1)
+    sorted_probabilities, sorted_indices = torch.sort(probabilities, dim=1, descending=True)
+    cumulative_before = torch.cumsum(sorted_probabilities, dim=1) - sorted_probabilities
+
+    # c_{k-1} < p selects the minimal prefix ending at the first c_k >= p.
+    hard_sorted = (cumulative_before < top_p).to(dtype=torch.float32)
+    soft_sorted = torch.sigmoid((top_p - cumulative_before) / ste_tau)
+
+    hard_flat = torch.zeros_like(probabilities)
+    soft_flat = torch.zeros_like(probabilities)
+    hard_flat.scatter_(1, sorted_indices, hard_sorted)
+    soft_flat.scatter_(1, sorted_indices, soft_sorted)
+    hard_mask = hard_flat.view_as(logits)
+    soft_mask = soft_flat.view_as(logits)
+    mask = hard_mask + soft_mask - soft_mask.detach()
+    soft_ratio = soft_flat.mean(dim=1)
+    return mask.to(dtype=logits.dtype), hard_mask, soft_mask, soft_ratio
+
+
 @torch.no_grad()
 def grid_mse_gain_score(x_base, x_native, target, grid_hw=16):
     base_err = (x_base.detach().float() - target.detach().float()).pow(2).mean(dim=1, keepdim=True)
@@ -920,6 +954,136 @@ def init_wandb_run(args, out_dir, dataset_len, world_size, trainable_count, is_m
         print(f"wandb disabled: init failed ({exc})", flush=True)
         return None
 
+_DATASET_MANIFEST_VERSION = 2
+
+
+class ManifestImageFolder(Dataset):
+    """ImageFolder-compatible dataset backed by a precomputed sample manifest."""
+
+    def __init__(self, root, samples, classes, class_to_idx, transform=None):
+        self.root = str(root)
+        self.samples = [(str(path), int(target)) for path, target in samples]
+        self.imgs = self.samples
+        self.targets = [target for _, target in self.samples]
+        self.classes = list(classes)
+        self.class_to_idx = dict(class_to_idx)
+        self.transform = transform
+        self.target_transform = None
+        self.loader = default_loader
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        image = self.loader(path)
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, target
+
+
+def _load_dataset_manifest(path):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    required = {"version", "root", "samples", "classes", "class_to_idx"}
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        raise ValueError(f"invalid dataset manifest schema: {path}")
+    return payload
+
+
+def _scan_flat_imagefolder(root):
+    """Scan ImageNet-style class directories without per-image NFS stat calls."""
+    with os.scandir(root) as entries:
+        classes = sorted(
+            entry.name
+            for entry in entries
+            if not entry.name.startswith(".") and entry.is_dir(follow_symlinks=False)
+        )
+    if not classes:
+        raise FileNotFoundError(f"no class directories found in {root}")
+
+    class_to_idx = {class_name: index for index, class_name in enumerate(classes)}
+    samples = []
+    empty_classes = []
+    for class_name in classes:
+        class_dir = root / class_name
+        with os.scandir(class_dir) as entries:
+            filenames = sorted(
+                entry.name
+                for entry in entries
+                if not entry.name.startswith(".") and entry.name.lower().endswith(IMG_EXTENSIONS)
+            )
+        if not filenames:
+            empty_classes.append(class_name)
+            continue
+        target = class_to_idx[class_name]
+        samples.extend((str(class_dir / filename), target) for filename in filenames)
+
+    if empty_classes:
+        raise FileNotFoundError(f"found no valid images in classes: {empty_classes[:8]}")
+    return samples, classes, class_to_idx
+
+
+def build_cached_imagefolder(args, distributed, rank):
+    root = Path(args.data_path).resolve()
+    manifest_path = Path(args.dataset_manifest) if args.dataset_manifest else root / ".mot_imagefolder_manifest_v2.pt"
+    manifest_path = manifest_path.resolve()
+    build_error = [None]
+
+    if rank == 0:
+        try:
+            rebuild = bool(args.rebuild_dataset_manifest)
+            if manifest_path.exists() and not rebuild:
+                try:
+                    payload = _load_dataset_manifest(manifest_path)
+                    rebuild = payload["version"] != _DATASET_MANIFEST_VERSION or payload["root"] != str(root)
+                except Exception:
+                    rebuild = True
+            else:
+                rebuild = True
+
+            if rebuild:
+                samples, classes, class_to_idx = _scan_flat_imagefolder(root)
+                payload = {
+                    "version": _DATASET_MANIFEST_VERSION,
+                    "root": str(root),
+                    "samples": samples,
+                    "classes": classes,
+                    "class_to_idx": class_to_idx,
+                }
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = manifest_path.with_name(f".{manifest_path.name}.tmp.{os.getpid()}")
+                try:
+                    torch.save(payload, tmp_path)
+                    os.replace(tmp_path, manifest_path)
+                finally:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                print(f"saved dataset manifest with {len(samples):,} samples to {manifest_path}", flush=True)
+            else:
+                print(f"using cached dataset manifest {manifest_path}", flush=True)
+        except Exception as exc:
+            build_error[0] = f"{type(exc).__name__}: {exc}"
+
+    if distributed:
+        dist.broadcast_object_list(build_error, src=0)
+    if build_error[0] is not None:
+        raise RuntimeError(f"failed to prepare dataset manifest: {build_error[0]}")
+    if distributed:
+        dist.barrier()
+
+    payload = _load_dataset_manifest(manifest_path)
+    if payload["version"] != _DATASET_MANIFEST_VERSION or payload["root"] != str(root):
+        raise RuntimeError(f"stale dataset manifest: {manifest_path}")
+    transform = make_transform(args.image_size, args.random_crop, args.random_flip)
+    return ManifestImageFolder(
+        root,
+        payload["samples"],
+        payload["classes"],
+        payload["class_to_idx"],
+        transform=transform,
+    )
+
+
 def main(args):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for training")
@@ -930,7 +1094,7 @@ def main(args):
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-    dataset = ImageFolder(args.data_path, transform=make_transform(args.image_size, args.random_crop, args.random_flip))
+    dataset = build_cached_imagefolder(args, distributed, rank)
     if args.limit_samples > 0:
         dataset = Subset(dataset, list(range(min(args.limit_samples, len(dataset)))))
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if distributed else None
@@ -987,8 +1151,9 @@ def main(args):
         detach_inputs=args.router_detach_inputs,
     ).to(device)
 
-    if args.mask_selection == "router_e2e_dynamic" and not args.train_router:
-        raise ValueError("router_e2e_dynamic requires --train-router")
+    router_modes = {"router_e2e_dynamic", "router_e2e_top_p"}
+    if args.mask_selection in router_modes and not args.train_router:
+        raise ValueError(f"{args.mask_selection} requires --train-router")
 
     if args.adapter_init:
         key, init_step = load_adapter_init(model, args.adapter_init, args.adapter_init_ema, strict=True)
@@ -1174,8 +1339,8 @@ def main(args):
     for step in range(start_step + 1, args.max_steps + 1):
         set_adapt_train_mode(model, args)
         core = model.module if distributed else model
-        current_lr = compute_lr(args, step, base_lr=args.lr)
-        current_lr_lg = compute_lr(args, step, base_lr=args.lr_llamagen)
+        current_lr = compute_lr(args, step, base_lr=args.lr, start_step=start_step)
+        current_lr_lg = compute_lr(args, step, base_lr=args.lr_llamagen, start_step=start_step)
         current_lr_d = compute_lr_for_scheduler(
             args,
             step,
@@ -1184,7 +1349,7 @@ def main(args):
             min_lr=args.min_lr_d,
             start_step=args.gan_start_step,
         )
-        router_only_active = args.mask_selection == "router_e2e_dynamic" and args.router_only_steps > 0 and step <= start_step + args.router_only_steps
+        router_only_active = args.mask_selection in router_modes and args.router_only_steps > 0 and step <= start_step + args.router_only_steps
         apply_router_only_trainability(core, args, router_only_active)
         g_freeze_active = args.g_freeze_steps > 0 and step <= start_step + args.g_freeze_steps
         for group in optimizer.param_groups:
@@ -1194,9 +1359,9 @@ def main(args):
             elif role == "llamagen":
                 group["lr"] = current_lr_lg
             elif role == "llamagen_encoder":
-                group["lr"] = compute_lr(args, step, base_lr=args.lr_llamagen_encoder)
+                group["lr"] = compute_lr(args, step, base_lr=args.lr_llamagen_encoder, start_step=start_step)
             elif role == "router":
-                group["lr"] = compute_lr(args, step, base_lr=args.lr_router)
+                group["lr"] = compute_lr(args, step, base_lr=args.lr_router, start_step=start_step)
             else:
                 group["lr"] = current_lr
         if optimizer_d is not None:
@@ -1347,13 +1512,18 @@ def main(args):
                 router_ratio_target = None
                 router_ratio_target_loss = x_lg.new_zeros(())
                 local_score_metric_values = score_metric_values
-                if args.mask_selection == "router_e2e_dynamic":
+                if args.mask_selection in router_modes:
                     router_logits, router_ratio_logits = core.router(f_1d_lg, x_base, f_2d_lg)
-                    router_ratio_logits = calibrate_ratio_logits_to_target_mean(router_ratio_logits, args)
-                    mask, hard_mask, router_soft_mask, router_ratio_soft = make_dynamic_budget_ste_mask(
-                        router_logits, router_ratio_logits, args, budget_debt_tokens=router_budget_debt_tokens
-                    )
-                    if getattr(args, "router_budget_mode", "soft") == "bank":
+                    if args.mask_selection == "router_e2e_top_p":
+                        mask, hard_mask, router_soft_mask, router_ratio_soft = make_top_p_ste_mask(
+                            router_logits, args
+                        )
+                    else:
+                        router_ratio_logits = calibrate_ratio_logits_to_target_mean(router_ratio_logits, args)
+                        mask, hard_mask, router_soft_mask, router_ratio_soft = make_dynamic_budget_ste_mask(
+                            router_logits, router_ratio_logits, args, budget_debt_tokens=router_budget_debt_tokens
+                        )
+                    if args.mask_selection == "router_e2e_dynamic" and getattr(args, "router_budget_mode", "soft") == "bank":
                         target_ratio_for_bank = float(getattr(args, "router_exact_budget_ratio", -1.0))
                         if target_ratio_for_bank < 0.0:
                             target_ratio_for_bank = float(args.router_target_mean_ratio)
@@ -1366,9 +1536,14 @@ def main(args):
                     mask = mask.to(dtype=f_1d_lg.dtype)
                     router_soft_mean = router_soft_mask.float().mean()
                     router_ratio_mean = router_ratio_soft.float().mean()
-                    router_budget_loss = (router_soft_mean - float(args.router_target_mean_ratio)).pow(2) + (
-                        router_ratio_mean - float(args.router_target_mean_ratio)
-                    ).pow(2)
+                    if args.mask_selection == "router_e2e_top_p":
+                        router_budget_loss = (router_soft_mean - float(args.router_target_mean_ratio)).pow(2)
+                        # Keep the legacy ratio head visible to DDP without using it to choose top-p K.
+                        router_budget_loss = router_budget_loss + router_ratio_logits.float().sum() * 0.0
+                    else:
+                        router_budget_loss = (router_soft_mean - float(args.router_target_mean_ratio)).pow(2) + (
+                            router_ratio_mean - float(args.router_target_mean_ratio)
+                        ).pow(2)
                     router_binary_loss = (router_soft_mask.float() * (1.0 - router_soft_mask.float())).mean()
                     local_score_metric_values = {
                         "score": global_mean_value(torch.sigmoid(router_logits.detach().float())),
@@ -1787,7 +1962,7 @@ def main(args):
                 f"lecam {running['lecam']/denom:.5f} | d_real {running['logits_real']/denom:.4f} | "
                 f"d_fake {running['logits_fake']/denom:.4f} | "
                 f"grad {running['grad']/denom:.4f} | lr {current_lr:.6g} lr_lg {current_lr_lg:.6g} "
-                f"lr_router {compute_lr(args, step, base_lr=args.lr_router):.6g} lr_d {current_lr_d:.6g} "
+                f"lr_router {compute_lr(args, step, base_lr=args.lr_router, start_step=start_step):.6g} lr_d {current_lr_d:.6g} "
                 f"phase {'g_freeze' if g_freeze_active else ('router_only' if router_only_active else 'joint')} | {sec:.3f}s/step | {stats}"
             )
             with log_path.open("a") as f:
@@ -1802,7 +1977,7 @@ def main(args):
                     "train/native_psnr": -10.0 * math.log10(max(native_mse, 1e-12)),
                     "train/lr": current_lr,
                     "train/lr_lg": current_lr_lg,
-                    "train/lr_router": compute_lr(args, step, base_lr=args.lr_router),
+                    "train/lr_router": compute_lr(args, step, base_lr=args.lr_router, start_step=start_step),
                     "train/lr_d": current_lr_d,
                     "train/sec_per_step": sec,
                     "train/phase_router_only": float(router_only_active),
@@ -1894,8 +2069,11 @@ def main(args):
         if core_d is not None:
             payload["discriminator"] = core_d.state_dict()
             payload["optimizer_d"] = optimizer_d.state_dict()
-        torch.save(payload, out_dir / "latest.pt")
-        print(f"saved {out_dir / 'latest.pt'}", flush=True)
+        if args.final_save:
+            torch.save(payload, out_dir / "latest.pt")
+            print(f"saved {out_dir / 'latest.pt'}", flush=True)
+        else:
+            print("skipped final checkpoint save (--no-final-save)", flush=True)
     if wandb_run is not None:
         wandb_run.finish()
     if distributed:
@@ -1906,6 +2084,8 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--data-path", type=str, default="../ImageNet/train")
+    parser.add_argument("--dataset-manifest", type=str, default="")
+    parser.add_argument("--rebuild-dataset-manifest", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output-dir", type=str, default="results/titok_llamagen_decoder_adapt_mix")
     parser.add_argument("--adapter-init", type=str, default="")
     parser.add_argument("--adapter-init-ema", action=argparse.BooleanOptionalAction, default=True)
@@ -2038,7 +2218,7 @@ def build_parser():
         "--mask-selection",
         type=str,
         default="per_image_random",
-        choices=["per_image_random", "accum_global_error", "accum_global_mixed_score", "accum_global_mixed_score_threshold", "router_e2e_dynamic"],
+        choices=["per_image_random", "accum_global_error", "accum_global_mixed_score", "accum_global_mixed_score_threshold", "router_e2e_dynamic", "router_e2e_top_p"],
     )
     parser.add_argument("--mask-ratio", type=float, default=0.5)
     parser.add_argument("--mask-error-weight", type=float, default=0.6)
@@ -2065,6 +2245,9 @@ def build_parser():
     parser.add_argument("--router-min-tokens", type=int, default=-1)
     parser.add_argument("--router-max-tokens", type=int, default=-1)
     parser.add_argument("--router-tau", type=float, default=0.7)
+    parser.add_argument("--router-top-p", type=float, default=0.95)
+    parser.add_argument("--router-top-p-temperature", type=float, default=1.0)
+    parser.add_argument("--router-top-p-ste-tau", type=float, default=0.01)
     parser.add_argument("--router-detach-inputs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--router-gain-aux-weight", type=float, default=0.1)
     parser.add_argument("--router-gain-aux-decay-steps", type=int, default=5000)
@@ -2085,6 +2268,7 @@ def build_parser():
     parser.add_argument("--save-epoch-every", type=int, default=0)
     parser.add_argument("--save-epoch-fraction-every", type=float, default=0.0)
     parser.add_argument("--save-step-checkpoints", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--final-save", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-steps", type=int, nargs="*", default=[])
     parser.add_argument("--sample-every", type=int, default=200)
     parser.add_argument("--sample-images", type=int, default=8)

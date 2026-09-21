@@ -1,134 +1,115 @@
-# MoT-1 H200 Fixed 0.5 Run
+# MoT: End-to-End Top-p Dynamic Token Allocation
 
-This repo is a minimal handoff package for the current MoT experiment. It trains the fixed-ratio 0.5 Router-selection version from the clean 66000 checkpoint on 8 H200 GPUs.
+This repository contains only the current MoT reconstruction pipeline: an end-to-end Router selects a variable number of 2D refinement grids with a differentiable top-p mask, while the tokenizer and decoder are jointly optimized.
 
-## 1. Clone
+Older fixed-ratio, E83 search, and E117/AR experiments are intentionally excluded from this branch.
 
-```bash
-git clone https://github.com/LCGLiChenge/MoT-1.git
-cd MoT-1
-```
+## Verified configuration
 
-## 2. Environment
+The current checkpoint was trained with top-p temperature `2.0` and `p=0.91`. Hard inference is calibrated separately with temperature `1.0` and `p=0.994897` to obtain an average budget of approximately 96 refinement tokens.
 
-```bash
-conda env create -n MoT1 -f environment.yml
-conda activate MoT1
-```
+On ImageNet validation (50,000 images, 256 x 256, EMA weights, Inception-2048 FID without input normalization), the verified checkpoint gives:
 
-## 3. External Code And Public Weights
+| Average 2D tokens | rFID | PSNR | LPIPS |
+|---:|---:|---:|---:|
+| 96.124 | 1.198612 | 19.5080 | 0.222875 |
 
-The default layout is relative to this repo:
+## Repository layout
 
 ```text
-../1d-tokenizer/modeling/titok.py
-../1d-tokenizer/tokenizer_titok_l32.bin
-../LlamaGen/tokenizer/tokenizer_image/vq_model.py
-../LlamaGen/pretrained_models/vq_ds16_c2i.pt
-../ImageNet/train
-../ImageNet/validation
-../.cache/torch/hub/facebookresearch_dinov2_main
-../.cache/open_clip
+configs/
+  top_p_train.yaml          # current 4-epoch continuation recipe
+  top_p_eval_5000.yaml      # quick checkpoint screening
+  top_p_eval_50000.yaml     # final ImageNet validation protocol
+models/
+  titok_to_llamagen.py      # shared TiTok/LlamaGen representation module
+train_titok_llamagen_recon.py
+train_titok_llamagen_decoder_adapt_global_gain_texture.py
+train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py
+eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py
+download_public_weights.py
+environment.yml
 ```
 
-If public weights or cached backbones are missing, run:
+`train_titok_llamagen_decoder_adapt_global_gain_texture.py` is retained because the evaluator imports shared spatial-score and feature-conversion utilities from it. The active allocation mode is `router_e2e_top_p`.
+
+## Environment
+
+```bash
+conda env create -n MoT -f environment.yml
+conda activate MoT
+```
+
+The default configs assume the following sibling layout:
+
+```text
+MoT-1/
+1d-tokenizer/
+  modeling/titok.py
+  configs/infer/TiTok/titok_l32.yaml
+  tokenizer_titok_l32.bin
+LlamaGen/
+  tokenizer/tokenizer_image/vq_model.py
+  pretrained_models/vq_ds16_c2i.pt
+ImageNet/
+  train/
+  validation/
+.cache/
+  torch/hub/facebookresearch_dinov2_main/
+  open_clip/
+```
+
+Public weights and feature backbones can be prepared with:
 
 ```bash
 python download_public_weights.py \
   --project-root .. \
-  --torch-cache-root ../.cache/torch \
-  --hf-endpoint https://hf-mirror.com
+  --torch-cache-root ../.cache/torch
 ```
 
-## 4. Private Checkpoint
+## Checkpoint
 
-This run needs the clean 66000 checkpoint at:
+Training and evaluation checkpoints are not stored in Git. Place an exact-resume checkpoint at:
 
 ```text
-weights/step_00066000.pt
+weights/top_p_resume.pt
 ```
 
-If it is not local, download it from the private Hugging Face checkpoint repo:
-
-```bash
-HF_HUB_DISABLE_XET=1 hf download Chloeeeeeeee123/MoT-1 \
-  weights/step_00066000.pt \
-  --repo-type model \
-  --local-dir .
-```
-
-## 5. Wandb
-
-The train config has wandb enabled. On the remote server, set the key provided by the project owner:
-
-```bash
-export WANDB_API_KEY=PASTE_KEY_HERE
-```
-
-To disable wandb for a smoke test, pass `--no-wandb`.
-
-## 6. Smoke Test
-
-Use a tiny run before launching the full job:
-
-```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 \
-torchrun --standalone --nproc_per_node=1 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
-  --config configs/h200_fixed050_from66000_20epoch.yaml \
-  --batch-size 1 \
-  --accum-steps 1 \
-  --limit-samples 8 \
-  --num-workers 0 \
-  --epochs 0.01 \
-  --save-every 0 \
-  --save-epoch-fraction-every 0 \
-  --no-save-step-checkpoints \
-  --no-latest-every-epoch \
-  --save-epoch-every 0 \
-  --sample-every 0 \
-  --no-wandb \
-  --log-every 1 \
-  --output-dir results/smoke_h200_fixed050_from66000
-```
-
-Delete only `results/smoke_h200_fixed050_from66000` after the smoke test passes.
-
-## 7. Train On 8 H200 GPUs
-
-```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-torchrun --standalone --nproc_per_node=8 train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
-  --config configs/h200_fixed050_from66000_20epoch.yaml
-```
-
-Main settings:
+For evaluation, place the selected checkpoint at:
 
 ```text
-resume: weights/step_00066000.pt
-batch_size: 24 per GPU
-accum_steps: 1
-epochs: 20
-ratio: fixed 0.5, exactly 128 grids per image
-router_only_epochs: 0.5
-full training starts after 0.5 epoch
-gan_start_epoch: 1.5
-d_warmup_epochs: 0.01
-lambda_gan: 0.12
-save: latest.pt only; no step or epoch checkpoint files
+weights/top_p_checkpoint.pt
 ```
 
-## 8. Eval
+The continuation config restores the raw model, optimizer, discriminator, discriminator optimizer, EMA, and Router state. Override `resume`, data paths, or output paths in the YAML when using another layout.
+
+## Train
+
+The current recipe uses 8 GPUs, batch size 20 per GPU, full GAN loss from the first resumed step, top-p temperature 2, and one checkpoint per epoch:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
-  --config configs/eval_h200_fixed050_50000.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+torchrun --standalone --nproc_per_node=8 \
+  train_titok_llamagen_decoder_adapt_router_f2d_e2e_dynamic.py \
+  --config configs/top_p_train.yaml
 ```
 
-For a specific checkpoint:
+## Evaluate
+
+Screen a checkpoint on 5,000 validation images:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
-  --config configs/eval_h200_fixed050_50000.yaml \
-  --ckpt results/h200_fixed050_from66000_20epoch_bs24/latest.pt \
-  --output-json results/h200_fixed050_from66000_20epoch_bs24/eval_latest_50000.json
+CUDA_VISIBLE_DEVICES=0 python \
+  eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
+  --config configs/top_p_eval_5000.yaml
 ```
+
+Run the final 50,000-image evaluation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python \
+  eval_titok_llamagen_mix_metrics_router_f2d_e2e_dynamic.py \
+  --config configs/top_p_eval_50000.yaml
+```
+
+Both evaluation configs use EMA weights and the calibrated hard-inference setting (`T=1`, `p=0.994897`).

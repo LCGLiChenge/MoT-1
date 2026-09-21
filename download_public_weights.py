@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Download public pretrained weights needed by the current MoT H200 run.
+"""Download public pretrained weights needed by the current MoT top-p pipeline.
 
 This does not download our private/trained checkpoint:
-  - weights/step_00066000.pt
+  - weights/top_p_resume.pt
 
 Use --test to download into a temporary directory and delete the test files after
 basic validation.
@@ -173,7 +173,7 @@ def public_weight_specs(project_root: Path, torch_cache_root: Path, hf_endpoint:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Download public pretrained weights for MoT H200 training.')
+    parser = argparse.ArgumentParser(description='Download public pretrained weights for MoT top-p training.')
     parser.add_argument('--project-root', type=Path, default=Path(".."), help='Root containing 1d-tokenizer and LlamaGen.')
     parser.add_argument('--torch-cache-root', type=Path, default=Path("../.cache/torch"), help='Torch cache root containing hub/checkpoints.')
     parser.add_argument('--test', action='store_true', help='Download into a temp dir, validate, then delete it.')
