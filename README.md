@@ -12,7 +12,11 @@ On ImageNet validation (50,000 images, 256 x 256, EMA weights, Inception-2048 FI
 
 | Average 2D tokens | rFID | PSNR | LPIPS |
 |---:|---:|---:|---:|
-| 96.124 | 1.198612 | 19.5080 | 0.222875 |
+| 97.5597 | 1.194390 | 19.4891 | 0.222953 |
+
+The values above are from the final 50,000-image evaluation of the latest
+continuation checkpoint. SSIM was not computed in this run; the checkpoint
+itself is intentionally kept outside Git because of its size.
 
 ## Repository layout
 
